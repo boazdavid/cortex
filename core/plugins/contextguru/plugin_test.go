@@ -81,6 +81,21 @@ func TestConfigure_RejectsBadEngine(t *testing.T) {
 	}
 }
 
+// Cortex cannot answer the engine's expand tool (no streamed-frame replacement, spec §4), so a
+// compacted body must never carry a reversible marker or the injected expand tool — whatever the
+// preset defaults to.
+func TestConfigure_NoReversibleMarkersEvenUnderAFullPreset(t *testing.T) {
+	p := configured(t, `{"engine": {"preset": "general"}}`)
+	pctx := inferencePctx("/v1/chat/completions", chatBody(bigToolOutput()))
+	invokeReq(p, pctx)
+	if bytes.Contains(pctx.Body, []byte("<<cg:")) {
+		t.Fatal("compacted body carries a reversible <<cg:…>> marker")
+	}
+	if bytes.Contains(pctx.Body, []byte("context_guru_expand")) {
+		t.Fatal("compacted body carries the expand tool")
+	}
+}
+
 func TestDialectFor(t *testing.T) {
 	cases := []struct {
 		path     string

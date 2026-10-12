@@ -182,6 +182,13 @@ func (p *ContextGuru) Configure(raw json.RawMessage) error {
 	if err != nil {
 		return fmt.Errorf("context-guru engine config: %w", err)
 	}
+	// marker_mode: full needs the expand loop — re-sending upstream with the stashed content when
+	// the model calls context_guru_expand — and Cortex cannot replace a streamed response with
+	// that second call's answer yet (spec §4, §9.2). Capped HERE, whatever the preset says,
+	// because every offloader defaults to full the moment it is on.
+	if err := cfg.CapMarkerMode("summary"); err != nil {
+		return fmt.Errorf("context-guru config: %w", err)
+	}
 	pipe, err := cfg.Build(logEmitter{}) // log what the engine does per request/component
 	if err != nil {
 		return fmt.Errorf("context-guru build pipeline: %w", err)
