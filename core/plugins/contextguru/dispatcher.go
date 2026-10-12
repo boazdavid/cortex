@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/rossoctl/context-guru/credmask"
 	"github.com/rossoctl/context-guru/keepalive"
@@ -47,8 +48,18 @@ func newCortexDispatcher(c *http.Client) *cortexDispatcher {
 
 // newPingClient is a standalone client that never routes through HTTPS_PROXY — a ping sent back
 // into this proxy would be recorded as agent traffic. The sentinel header is the second guard.
+//
+// It never follows a redirect: Go's default client strips Authorization/Cookie on a cross-host
+// redirect, but not x-api-key / x-goog-api-key, so a 307/308 could carry a credential header to a
+// host the operator never intended it for. Matches core/tlsbridge/upstream.go's choice.
+// IdleConnTimeout bounds how long an idle connection is kept around between pings.
 func newPingClient() *http.Client {
-	return &http.Client{Transport: &http.Transport{Proxy: nil}}
+	return &http.Client{
+		Transport: &http.Transport{Proxy: nil, IdleConnTimeout: 90 * time.Second},
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 }
 
 // hold captures the upstream and the credential a finished request carried, masked. It replaces
@@ -71,6 +82,12 @@ func (d *cortexDispatcher) hold(key keepalive.Key, scheme, host string, reqHeade
 		zeroAll(prev.auth)
 	}
 	d.held[key] = heldTarget{scheme: scheme, host: host, auth: auth}
+}
+
+// Close releases the ping client's idle connections. Called from Shutdown so a hot-reloaded
+// instance's connections do not linger past it.
+func (d *cortexDispatcher) Close() {
+	d.client.CloseIdleConnections()
 }
 
 // Release runs under the keeper's lock: zeroize and forget, nothing else.

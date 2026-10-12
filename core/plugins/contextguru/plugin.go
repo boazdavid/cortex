@@ -355,6 +355,9 @@ func (p *ContextGuru) Shutdown(context.Context) error {
 	if p.keeper != nil {
 		p.keeper.Shutdown()
 	}
+	if p.disp != nil {
+		p.disp.Close()
+	}
 	return nil
 }
 
@@ -474,7 +477,7 @@ func sessionID(pctx *pipeline.Context) string {
 // ConfigSchema surfaces the operator-facing fields in agentop / /v1/plugins.
 func (p *ContextGuru) ConfigSchema() []pipeline.FieldSchema {
 	return []pipeline.FieldSchema{
-		{Name: "paths", Type: "[]string", Description: "Inference request paths to compact (default: chat/completions, completions, messages)."},
+		{Name: "paths", Type: "[]string", Description: "Inference request paths to compact (default: chat/completions, completions, messages, responses)."},
 		{Name: "model", Type: "object", Description: "Optional static cheap model for LLM-backed components (summarize, extract:code)."},
 		{Name: "engine", Type: "object", Description: "Native context-guru config: preset / pipeline / per-component (marker_mode) / store."},
 		{Name: "keep_alive", Type: "object", Description: "Opt-in prompt-cache keep-alive: enabled, idle_seconds (270), max_pings (2), max_usd_per_ping (0.50), min_prefix_tokens (80000). Pings bill the caller's own credential; their spend is logged, not in the cost ledger."},
