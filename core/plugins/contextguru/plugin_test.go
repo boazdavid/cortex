@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -80,12 +81,48 @@ func TestConfigure_RejectsBadEngine(t *testing.T) {
 	}
 }
 
-func TestProviderFor(t *testing.T) {
-	if providerFor("/v1/messages") != bschemas.Anthropic {
-		t.Fatal("/v1/messages should map to anthropic")
+func TestDialectFor(t *testing.T) {
+	cases := []struct {
+		path     string
+		provider bschemas.ModelProvider
+		api      string
+	}{
+		{"/v1/messages", bschemas.Anthropic, ""},
+		{"/anthropic/v1/messages", bschemas.Anthropic, ""},
+		{"/v1/responses", bschemas.OpenAI, "responses"},
+		{"/openai/v1/responses", bschemas.OpenAI, "responses"},
+		{"/v1/chat/completions", bschemas.OpenAI, ""},
 	}
-	if providerFor("/v1/chat/completions") != bschemas.OpenAI {
-		t.Fatal("/v1/chat/completions should map to openai")
+	for _, c := range cases {
+		p, api := dialectFor(c.path)
+		if p != c.provider || api != c.api {
+			t.Errorf("dialectFor(%q) = (%s, %q), want (%s, %q)", c.path, p, api, c.provider, c.api)
+		}
+	}
+}
+
+func TestConfigure_DefaultPathsIncludeResponses(t *testing.T) {
+	p := configured(t, `{}`)
+	for _, want := range []string{"/v1/chat/completions", "/v1/completions", "/v1/messages", "/v1/responses"} {
+		if !p.gated(want) {
+			t.Errorf("default paths do not gate %s", want)
+		}
+	}
+}
+
+func TestOnRequest_CompactsAResponsesBody(t *testing.T) {
+	p := configured(t, collapseEngine)
+	body := []byte(`{"model":"gpt-5.6","input":[` +
+		`{"type":"message","role":"user","content":"run it"},` +
+		`{"type":"function_call","call_id":"c1","name":"sh","arguments":"{}"},` +
+		`{"type":"function_call_output","call_id":"c1","output":` + strconv.Quote(bigToolOutput()) + `}]}`)
+	pctx := inferencePctx("/v1/responses", body)
+	invokeReq(p, pctx)
+	if len(pctx.Body) >= len(body) {
+		t.Fatalf("Responses body not compacted: %d >= %d bytes", len(pctx.Body), len(body))
+	}
+	if !json.Valid(pctx.Body) {
+		t.Fatal("compacted Responses body is not valid JSON")
 	}
 }
 

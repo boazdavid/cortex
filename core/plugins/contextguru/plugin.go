@@ -170,7 +170,7 @@ func (p *ContextGuru) Configure(raw json.RawMessage) error {
 		}
 	}
 	if len(p.cfg.Paths) == 0 {
-		p.cfg.Paths = []string{"/v1/chat/completions", "/v1/completions", "/v1/messages"}
+		p.cfg.Paths = []string{"/v1/chat/completions", "/v1/completions", "/v1/messages", "/v1/responses"}
 	}
 
 	// Engine config: default to the balanced preset when none is supplied.
@@ -244,13 +244,13 @@ func (p *ContextGuru) OnRequest(ctx context.Context, pctx *pipeline.Context) pip
 		slog.Debug("context-guru skipped request with no session identity", "path", pctx.Path)
 		return cont
 	}
-	provider := providerFor(pctx.Path)
-	models := cgcomponents.ModelSpec{
-		Static:   p.static,
-		Incoming: p.incomingModel(pctx, provider),
-	}
+	provider, api := dialectFor(pctx.Path)
+	models := cgcomponents.ModelSpec{Static: p.static, Incoming: p.incomingModel(pctx, provider, api)}
 	before := len(pctx.Body)
-	out, changed := apply.BodyWithModel(ctx, p.pipe, p.store, provider, pctx.Body, sid, false, models)
+	res := apply.BodyOpts(ctx, p.pipe, p.store, apply.Opts{
+		Provider: provider, Body: pctx.Body, API: api, Session: sid, Models: models,
+	})
+	out, changed := res.Body, res.Changed
 	if changed && len(out) > 0 {
 		// Per-request byte-level view (the engine's token-level view is logged by
 		// logEmitter.Run). The framework also emits a body-mutation session event.
@@ -284,23 +284,28 @@ func (p *ContextGuru) gated(path string) bool {
 	return false
 }
 
-// providerFor maps the request path to the bifrost provider dialect the engine
-// parses the body as.
-func providerFor(path string) bschemas.ModelProvider {
-	if strings.HasSuffix(path, "/v1/messages") {
-		return bschemas.Anthropic
+// dialectFor maps the request path to the bifrost provider the engine parses the body as, and
+// the wire envelope within it: OpenAI's Responses API ("responses") is a different body shape
+// (instructions + input) from Chat Completions, which apply.Opts.API selects.
+func dialectFor(path string) (bschemas.ModelProvider, string) {
+	switch {
+	case strings.HasSuffix(path, "/v1/messages"):
+		return bschemas.Anthropic, ""
+	case strings.HasSuffix(path, "/v1/responses"):
+		return bschemas.OpenAI, "responses"
 	}
-	return bschemas.OpenAI
+	return bschemas.OpenAI, ""
 }
 
 // incomingModel reconstructs the agent's own model client from the live request
 // (base URL + token-exchanged Authorization + the request's model), so an engine
-// component with model.source: incoming reuses it. OpenAI-dialect only (llmclient
-// speaks /v1/chat/completions); returns nil for anthropic or when the pieces
-// aren't present, in which case the engine falls back to the static model or
-// degrades to deterministic.
-func (p *ContextGuru) incomingModel(pctx *pipeline.Context, provider bschemas.ModelProvider) cgcomponents.Model {
-	if provider != bschemas.OpenAI || pctx.Host == "" {
+// component with model.source: incoming reuses it. OpenAI chat-completions dialect
+// only (llmclient speaks /v1/chat/completions, not the Responses API's
+// instructions+input shape); returns nil for anthropic, for api == "responses", or
+// when the pieces aren't present, in which case the engine falls back to the
+// static model or degrades to deterministic.
+func (p *ContextGuru) incomingModel(pctx *pipeline.Context, provider bschemas.ModelProvider, api string) cgcomponents.Model {
+	if provider != bschemas.OpenAI || api == "responses" || pctx.Host == "" {
 		return nil
 	}
 	model := modelFromBody(pctx.Body)
