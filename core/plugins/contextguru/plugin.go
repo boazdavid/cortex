@@ -37,6 +37,7 @@ import (
 	_ "github.com/rossoctl/context-guru/components/offload"  // register offload components
 	_ "github.com/rossoctl/context-guru/components/reformat" // register reformat components
 	cgconfig "github.com/rossoctl/context-guru/config"
+	"github.com/rossoctl/context-guru/keepalive"
 	cgstore "github.com/rossoctl/context-guru/store"
 )
 
@@ -95,6 +96,14 @@ func (logEmitter) Run(r cgcomponents.RunReport) {
 		"tokensSaved", r.Saved(), "pctSaved", pct(r.TokensBefore, r.TokensAfter), "components", fired)
 }
 
+// KeepAlivePing logs each ping's cost. Until Cortex has a CostRecorder (spec §9.3) this log line is
+// the only record of keep-alive spend in Cortex. It carries no header and no body.
+func (logEmitter) KeepAlivePing(r cgcomponents.KeepAliveReport) {
+	slog.Info("context-guru keep-alive ping", "session", r.Session, "model", r.Model,
+		"ping", r.Pings, "cacheRead", r.CacheRead, "cacheWrite", r.CacheWrite,
+		"output", r.Output, "costUSD", r.CostUSD, "status", r.Status, "ms", r.DurationMs)
+}
+
 func pct(before, after int) string {
 	if before <= 0 {
 		return "0%"
@@ -110,6 +119,8 @@ type contextGuruConfig struct {
 	Paths  []string        `json:"paths"`
 	Model  *modelConfig    `json:"model"`
 	Engine json.RawMessage `json:"engine"`
+	// KeepAlive is the opt-in prompt-cache keep-alive. Off unless enabled: true.
+	KeepAlive keepAliveConfig `json:"keep_alive"`
 }
 
 // cgModel adapts an llmclient.Client to context-guru's components.Model interface
@@ -145,6 +156,12 @@ type ContextGuru struct {
 	modelTO  time.Duration
 	modelMax int
 	rates    pricing.Resolver
+
+	// Keep-alive, all nil/zero unless keep_alive.enabled. The keeper decides when to ping; disp
+	// only sends and holds the credential.
+	keeper *keepalive.Keeper
+	disp   *cortexDispatcher
+	kaPol  keepalive.Policy
 }
 
 // SetPricingResolver receives Cortex's rate table (plugins.Deps, before Configure).
@@ -201,6 +218,24 @@ func (p *ContextGuru) Configure(raw json.RawMessage) error {
 	p.pipe = pipe
 	p.store = cfg.NewStore()
 
+	if p.keeper != nil {
+		// A second Configure on one instance must not orphan the first keeper's holds.
+		p.keeper.Shutdown()
+		p.keeper, p.disp, p.kaPol = nil, nil, keepalive.Policy{}
+	}
+	if p.cfg.KeepAlive.Enabled {
+		p.kaPol = p.cfg.KeepAlive.policy()
+		p.disp = newCortexDispatcher(newPingClient())
+		p.keeper = keepalive.New(keepalive.Options{
+			Dispatcher: p.disp,
+			Prices:     resolverPricer{r: func() pricing.Resolver { return p.rates }},
+		})
+		slog.Warn("context-guru keep-alive enabled: idle sessions are pinged on the caller's own "+
+			"credential, and that spend is logged but does not reach Cortex's cost ledger",
+			"idle", p.kaPol.Idle, "maxPings", p.kaPol.MaxPings, "maxUSDPerPing", p.kaPol.MaxUSDPerPing,
+			"minPrefixTokens", p.kaPol.MinPrefixTokens)
+	}
+
 	// Model timeouts / caps (shared by static + incoming clients).
 	p.modelTO = defaultModelTimeout
 	p.modelMax = 4096
@@ -245,13 +280,23 @@ func (p *ContextGuru) OnRequest(ctx context.Context, pctx *pipeline.Context) pip
 	if pctx.Headers != nil && pctx.Headers.Get(sentinelHeader) != "" {
 		return cont
 	}
-	if p.pipe == nil || len(pctx.Body) == 0 || !p.gated(pctx.Path) {
+	if !p.gated(pctx.Path) {
+		return cont
+	}
+	sid := sessionID(pctx)
+	// A real request on this session ends its idle span: the keeper drops the entry (and the
+	// credential it held) before this request goes upstream, so no ping races it. A subagent's
+	// request says nothing about whether the main thread is idle, and the main thread is the only
+	// one recorded, so it leaves the main thread's entry alone.
+	if p.keeper != nil && sid != "" && !isSubagent(pctx) {
+		p.keeper.Arrive(keepalive.Key{Session: sid})
+	}
+	if p.pipe == nil || len(pctx.Body) == 0 {
 		return cont
 	}
 	// The engine Store is keyed by session for per-caller isolation. With no
 	// session identity every such request would share one empty key and bleed
 	// compaction state across unrelated callers, so skip compaction entirely.
-	sid := sessionID(pctx)
 	if sid == "" {
 		slog.Debug("context-guru skipped request with no session identity", "path", pctx.Path)
 		return cont
@@ -284,6 +329,49 @@ func (p *ContextGuru) OnRequest(ctx context.Context, pctx *pipeline.Context) pip
 // later integration; the Store + session key are already threaded for it.
 func (p *ContextGuru) OnResponse(_ context.Context, _ *pipeline.Context) pipeline.Action {
 	return pipeline.Action{Type: pipeline.Continue}
+}
+
+// Init starts the keep-alive sweep. Nothing to start when keep_alive is off.
+func (p *ContextGuru) Init(context.Context) error {
+	if p.keeper != nil {
+		p.keeper.Start()
+	}
+	return nil
+}
+
+// Shutdown stops the sweep and releases every held credential before returning (spec §6.3): on a
+// hot-reload this instance is the old one, and its holds must not outlive it.
+func (p *ContextGuru) Shutdown(context.Context) error {
+	if p.keeper != nil {
+		p.keeper.Shutdown()
+	}
+	return nil
+}
+
+// OnFinish hands the finished request to the keeper. Here and not in OnResponse: inference-parser
+// settles token counts after this plugin's response hook, and by OnFinish they are final and
+// pctx.Body still holds the compacted bytes that went upstream (spec §8). A mapping and one
+// Record call — no I/O — so it stays far inside the finish timeout and cannot change the outcome.
+func (p *ContextGuru) OnFinish(_ context.Context, pctx *pipeline.Context) {
+	if p.keeper == nil || (pctx.Headers != nil && pctx.Headers.Get(sentinelHeader) != "") ||
+		!p.gated(pctx.Path) {
+		return
+	}
+	sid := sessionID(pctx)
+	key := keepalive.Key{Session: sid}
+	hdr := pctx.Headers
+	scheme, host := pctx.Scheme, pctx.Host
+	disp := p.disp
+	r, ok := recordFor(pctx, sid, p.kaPol, func() { disp.hold(key, scheme, host, hdr) })
+	if !ok {
+		return
+	}
+	p.keeper.Record(r)
+}
+
+func isSubagent(pctx *pipeline.Context) bool {
+	inf := pctx.Extensions.Inference
+	return inf != nil && inf.AgentRole == pipeline.AgentRoleSubagent
 }
 
 // gated reports whether the request path is an inference path the plugin acts on.
@@ -374,12 +462,17 @@ func (p *ContextGuru) ConfigSchema() []pipeline.FieldSchema {
 		{Name: "paths", Type: "[]string", Description: "Inference request paths to compact (default: chat/completions, completions, messages)."},
 		{Name: "model", Type: "object", Description: "Optional static cheap model for LLM-backed components (summarize, extract:code)."},
 		{Name: "engine", Type: "object", Description: "Native context-guru config: preset / pipeline / per-component (marker_mode) / store."},
+		{Name: "keep_alive", Type: "object", Description: "Opt-in prompt-cache keep-alive: enabled, idle_seconds (270), max_pings (2), max_usd_per_ping (0.50), min_prefix_tokens (80000). Pings bill the caller's own credential; their spend is logged, not in the cost ledger."},
 	}
 }
 
 var (
-	_ pipeline.Plugin          = (*ContextGuru)(nil)
-	_ pipeline.Configurable    = (*ContextGuru)(nil)
-	_ pipeline.SchemaProvider  = (*ContextGuru)(nil)
-	_ pricing.ResolverConsumer = (*ContextGuru)(nil)
+	_ pipeline.Plugin               = (*ContextGuru)(nil)
+	_ pipeline.Configurable         = (*ContextGuru)(nil)
+	_ pipeline.SchemaProvider       = (*ContextGuru)(nil)
+	_ pricing.ResolverConsumer      = (*ContextGuru)(nil)
+	_ pipeline.Initializer          = (*ContextGuru)(nil)
+	_ pipeline.Shutdowner           = (*ContextGuru)(nil)
+	_ pipeline.Finisher             = (*ContextGuru)(nil)
+	_ cgcomponents.KeepAliveEmitter = logEmitter{}
 )
