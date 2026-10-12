@@ -26,6 +26,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rossoctl/cortex/core/cost/pricing"
 	"github.com/rossoctl/cortex/core/llmclient"
 	"github.com/rossoctl/cortex/core/pipeline"
 	"github.com/rossoctl/cortex/core/plugins"
@@ -143,7 +144,11 @@ type ContextGuru struct {
 	static   cgcomponents.Model
 	modelTO  time.Duration
 	modelMax int
+	rates    pricing.Resolver
 }
+
+// SetPricingResolver receives Cortex's rate table (plugins.Deps, before Configure).
+func (p *ContextGuru) SetPricingResolver(r pricing.Resolver) { p.rates = r }
 
 // New returns an unconfigured plugin instance.
 func New() *ContextGuru { return &ContextGuru{} }
@@ -373,7 +378,8 @@ func (p *ContextGuru) ConfigSchema() []pipeline.FieldSchema {
 }
 
 var (
-	_ pipeline.Plugin         = (*ContextGuru)(nil)
-	_ pipeline.Configurable   = (*ContextGuru)(nil)
-	_ pipeline.SchemaProvider = (*ContextGuru)(nil)
+	_ pipeline.Plugin          = (*ContextGuru)(nil)
+	_ pipeline.Configurable    = (*ContextGuru)(nil)
+	_ pipeline.SchemaProvider  = (*ContextGuru)(nil)
+	_ pricing.ResolverConsumer = (*ContextGuru)(nil)
 )
