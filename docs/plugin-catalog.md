@@ -51,11 +51,13 @@ No configuration — registered as a bare plugin name, no `config:` block.
 
 Compacts an agent's outbound LLM request context before forwarding,
 using the embedded context-guru engine. `OnResponse` is currently a
-pass-through; model-driven expand/restore is a later integration.
-Opt-in at build time (`-tags include_plugin_contextguru`) because its
-engine pulls a large transitive dependency set.
+pass-through; model-driven expand/restore is a later integration. The
+plugin also implements `OnFinish`, `Init`, and `Shutdown` for the
+keep-alive feature below. Opt-in at build time
+(`-tags include_plugin_contextguru`) because its engine pulls a large
+transitive dependency set.
 
-- `paths` (`[]string`) — inference request paths to compact. Default: `/v1/chat/completions`, `/v1/completions`, `/v1/messages`.
+- `paths` (`[]string`) — inference request paths to compact. Default: `/v1/chat/completions`, `/v1/completions`, `/v1/messages`, `/v1/responses`.
 - `model` (object) — optional "cheap" LLM endpoint for model-backed components (summarize, extract:code); omitted means those degrade to deterministic/no-op.
   - `base_url` — OpenAI-compatible endpoint base.
   - `model` — model name to call.
@@ -63,6 +65,18 @@ engine pulls a large transitive dependency set.
   - `max_tokens` — completion cap, default 4096.
   - `timeout_ms` — per-call timeout, default 150000.
 - `engine` (object) — native context-guru config (preset / pipeline / per-component / store), passed through verbatim. Default: `preset: balanced`.
+- `keep_alive` (object) — opt-in. Pings an idle session's prompt cache before it expires, so the next turn is a cache hit instead of a full re-send. Off by default; every decision (whether to ping, how much, when to stop) stays inside the context-guru engine, not this plugin.
+  - `enabled` (bool) — turn keep-alive on. Default: `false`.
+  - `idle_seconds` (int) — idle time before the first ping, measured from the previous request's start. Default: `270`.
+  - `max_pings` (int) — most pings sent in one idle span. Default: `2`.
+  - `max_usd_per_ping` (float) — refuse a ping whose projected cost exceeds this, in USD. Default: `0.50`.
+  - `min_prefix_tokens` (int) — billed prefix a session must reach before it becomes eligible for a ping. Default: `80000`.
+
+  **Ordering:** any plugin that injects or exchanges the real credential must run *before* `context-guru`, or the keep-alive holds the placeholder and its pings are refused (spec §6.4). A refused ping stops that session silently.
+
+  **Spend:** each ping is billed to the caller's credential and logged as `context-guru keep-alive ping` with `costUSD`. It does not appear in `/v1/usage` or the cost ledger yet.
+
+  **Markers:** `marker_mode` is capped at `summary`; content the engine drops is not restorable through Cortex.
 
 ## `cpex`
 
