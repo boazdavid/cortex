@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/rossoctl/cortex/core/cost/pricing"
@@ -162,6 +163,11 @@ type ContextGuru struct {
 	keeper *keepalive.Keeper
 	disp   *cortexDispatcher
 	kaPol  keepalive.Policy
+	// stopped is set at the start of Shutdown. After a hot-reload the old pipeline is shut down
+	// once its drain window ends, and a long streaming request still on it reaches OnFinish
+	// later. keepalive.Keeper.Record has no stopped check of its own, so without this flag that
+	// request would hold its credential again on a keeper whose sweep is gone.
+	stopped atomic.Bool
 }
 
 // SetPricingResolver receives Cortex's rate table (plugins.Deps, before Configure).
@@ -218,6 +224,9 @@ func (p *ContextGuru) Configure(raw json.RawMessage) error {
 	p.pipe = pipe
 	p.store = cfg.NewStore()
 
+	// A keeper built here stays unstarted until Init runs. The normal lifecycle is Configure, then
+	// Init, on a fresh instance; a Configure after Init does not happen there, and a keeper it
+	// built would not sweep until Init is called again.
 	if p.keeper != nil {
 		// A second Configure on one instance must not orphan the first keeper's holds.
 		p.keeper.Shutdown()
@@ -288,7 +297,7 @@ func (p *ContextGuru) OnRequest(ctx context.Context, pctx *pipeline.Context) pip
 	// credential it held) before this request goes upstream, so no ping races it. A subagent's
 	// request says nothing about whether the main thread is idle, and the main thread is the only
 	// one recorded, so it leaves the main thread's entry alone.
-	if p.keeper != nil && sid != "" && !isSubagent(pctx) {
+	if p.keeper != nil && !p.stopped.Load() && sid != "" && !isSubagent(pctx) {
 		p.keeper.Arrive(keepalive.Key{Session: sid})
 	}
 	if p.pipe == nil || len(pctx.Body) == 0 {
@@ -342,6 +351,7 @@ func (p *ContextGuru) Init(context.Context) error {
 // Shutdown stops the sweep and releases every held credential before returning (spec §6.3): on a
 // hot-reload this instance is the old one, and its holds must not outlive it.
 func (p *ContextGuru) Shutdown(context.Context) error {
+	p.stopped.Store(true)
 	if p.keeper != nil {
 		p.keeper.Shutdown()
 	}
@@ -353,6 +363,11 @@ func (p *ContextGuru) Shutdown(context.Context) error {
 // pctx.Body still holds the compacted bytes that went upstream (spec §8). A mapping and one
 // Record call — no I/O — so it stays far inside the finish timeout and cannot change the outcome.
 func (p *ContextGuru) OnFinish(_ context.Context, pctx *pipeline.Context) {
+	// A request that finishes after Shutdown (one still draining on the old pipeline after a
+	// hot-reload) must hold nothing: no sweep would ever ping it.
+	if p.stopped.Load() {
+		return
+	}
 	if p.keeper == nil || (pctx.Headers != nil && pctx.Headers.Get(sentinelHeader) != "") ||
 		!p.gated(pctx.Path) {
 		return

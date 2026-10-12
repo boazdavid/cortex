@@ -63,3 +63,13 @@ func newHeaderSink(t *testing.T, got *http.Header) *httptest.Server {
 	t.Cleanup(srv.Close)
 	return srv
 }
+
+func TestPingClientBypassesTheProxy(t *testing.T) {
+	tr, ok := newPingClient().Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("ping client transport is %T, want *http.Transport", newPingClient().Transport)
+	}
+	if tr.Proxy != nil {
+		t.Fatal("ping client routes through a proxy; a ping sent back into Cortex would be recorded as agent traffic")
+	}
+}

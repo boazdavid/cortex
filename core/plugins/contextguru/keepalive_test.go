@@ -200,3 +200,26 @@ func TestConfigSchemaListsKeepAlive(t *testing.T) {
 	}
 	t.Fatal("ConfigSchema has no keep_alive entry")
 }
+
+func TestRequestFinishingAfterShutdownHoldsNothing(t *testing.T) {
+	p := configured(t, `{"keep_alive": {"enabled": true, "min_prefix_tokens": 1}}`)
+	if err := p.Init(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	finishTurns(t, p, 2)
+	if n := heldCount(p); n != 1 {
+		t.Fatalf("held credentials before Shutdown = %d, want 1", n)
+	}
+	if err := p.Shutdown(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	// Requests still draining on the old pipeline after a hot-reload. Two of them, because
+	// Keeper.Shutdown resets the turn counter and a lone turn 0 is never tracked anyway.
+	finishTurns(t, p, 2)
+	if n := heldCount(p); n != 0 {
+		t.Fatalf("held credentials after a post-Shutdown finish = %d, want 0", n)
+	}
+	if n := p.keeper.Stats().Live; n != 0 {
+		t.Fatalf("live entries after a post-Shutdown finish = %d, want 0", n)
+	}
+}
