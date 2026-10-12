@@ -57,7 +57,13 @@ keep-alive feature below. Opt-in at build time
 (`-tags include_plugin_contextguru`) because its engine pulls a large
 transitive dependency set.
 
-- `paths` (`[]string`) — inference request paths to compact. Default: `/v1/chat/completions`, `/v1/completions`, `/v1/messages`, `/v1/responses`.
+`marker_mode` is capped at `summary`; content the engine drops is not
+restorable through Cortex. `/v1/responses` is gated by default (see
+`paths` below), so Codex traffic routed through the TLS bridge is now
+compacted too. Both of these apply whether or not `keep_alive` is
+enabled.
+
+- `paths` (`[]string`) — inference request paths to compact. Default: `/v1/chat/completions`, `/v1/completions`, `/v1/messages`, `/v1/responses`. Only a path ending in `/v1/responses` matches the Responses dialect — Codex's own `/backend-api/codex/responses` does not, so neither compaction nor keep-alive pings apply to it; the engine pings only `route == "/v1/responses"`.
 - `model` (object) — optional "cheap" LLM endpoint for model-backed components (summarize, extract:code); omitted means those degrade to deterministic/no-op.
   - `base_url` — OpenAI-compatible endpoint base.
   - `model` — model name to call.
@@ -72,11 +78,15 @@ transitive dependency set.
   - `max_usd_per_ping` (float) — refuse a ping whose projected cost exceeds this, in USD. Default: `0.50`.
   - `min_prefix_tokens` (int) — billed prefix a session must reach before it becomes eligible for a ping. Default: `80000`.
 
-  **Ordering:** any plugin that injects or exchanges the real credential must run *before* `context-guru`, or the keep-alive holds the placeholder and its pings are refused (spec §6.4). A refused ping stops that session silently.
+  **Ordering:** `OnFinish` reads `pctx.Headers` after the whole outbound chain has run, so the credential a ping holds is whatever actually went upstream — this holds regardless of where `context-guru` sits relative to a token-exchange or credential-injection plugin. A short-lived exchanged token can still expire before the ping fires; the ping then gets a 4xx from the upstream, which stops keep-alive for that session.
+
+  **Transport:** pings dial the upstream directly with the system root CAs. They do not use `tls_bridge.upstream_ca_bundle` / `upstream_insecure` or the mesh mTLS dialer, so a private-CA or mTLS-only upstream refuses every ping (spec §9.1). Ping failures and refusals are logged at DEBUG; a successful ping logs at INFO. A model with no rate in Cortex's pricing table pings with no cost ceiling enforced, and logs `costUSD` 0.
 
   **Spend:** each ping is billed to the caller's credential and logged as `context-guru keep-alive ping` with `costUSD`. It does not appear in `/v1/usage` or the cost ledger yet.
 
-  **Markers:** `marker_mode` is capped at `summary`; content the engine drops is not restorable through Cortex.
+  **Credential retention:** Cortex keeps the caller's credential in memory, masked, for up to `(max_pings + 1) × idle_seconds` per tracked session — about 13.5 minutes at the defaults above. It is released on that session's next request, on plugin `Shutdown` or a config reload, or at that deadline, whichever comes first.
+
+  **Hot-reload:** every config hot-reload tears down and rebuilds the pipeline, which drops all keep-alive tracking state. During the drain window, the outgoing instance may still send one more ping for a session the new instance no longer tracks.
 
 ## `cpex`
 

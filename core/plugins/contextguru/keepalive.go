@@ -6,6 +6,7 @@ import (
 	cgconfig "github.com/rossoctl/context-guru/config"
 	"github.com/rossoctl/context-guru/keepalive"
 	"github.com/rossoctl/cortex/core/pipeline"
+	"github.com/rossoctl/cortex/core/plugins/internal/parsercommon"
 )
 
 // keepAliveConfig is the plugin's `keep_alive:` block — one static policy, no strategies and no
@@ -43,12 +44,6 @@ func (c keepAliveConfig) policy() keepalive.Policy {
 	return pol
 }
 
-// Bit layout of InferenceExtension.PresentKinds (parsercommon.Kind).
-const (
-	presentCacheRead  = 2
-	presentCacheWrite = 4
-)
-
 // recordFor maps a finished request to what the keeper needs. Mapping only: whether the request
 // is worth tracking is the keeper's call. The one filter here is about identity, not policy —
 // Cortex knows a request is a subagent's but not WHICH subagent, so recording it would replace the
@@ -69,7 +64,7 @@ func recordFor(pctx *pipeline.Context, sid string, pol keepalive.Policy, hold fu
 		Status:    pctx.StatusCode,
 		Usage: keepalive.Usage{FreshInput: int64(inf.InputTokens), CacheRead: int64(inf.CacheReadTokens),
 			CacheWrite: int64(inf.CacheWriteTokens), Output: int64(inf.OutputTokens)},
-		UsageOK: inf.PresentKinds&(presentCacheRead|presentCacheWrite) != 0,
+		UsageOK: parsercommon.Kind(inf.PresentKinds)&(parsercommon.KindCacheRead|parsercommon.KindCacheWrite) != 0,
 		Policy:  pol,
 		Agent:   pctx.Headers.Get("User-Agent"),
 		Header:  pctx.Headers,
