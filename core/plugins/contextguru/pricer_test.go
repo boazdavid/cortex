@@ -52,6 +52,28 @@ func TestResolverPricerUnsetTierIsUnpriced(t *testing.T) {
 	}
 }
 
+func TestResolverPricerUnsetCacheWriteFallsBackToInput(t *testing.T) {
+	r := ratesOf(3e-6, 3.75e-6, 0.3e-6, 15e-6)
+	r.Set[pricing.TierCacheWrite] = false
+	p := resolverPricer{r: func() pricing.Resolver { return &fixedResolver{rates: r} }}
+	price, ok := p.Price(context.Background(), "h", "m", 1)
+	if !ok {
+		t.Fatal("a rate table with only cache-write unset left the ping unpriced")
+	}
+	if price.CacheWrite != price.Input {
+		t.Fatalf("CacheWrite = %v, want it to fall back to Input = %v", price.CacheWrite, price.Input)
+	}
+}
+
+func TestResolverPricerUnsetOutputIsUnpriced(t *testing.T) {
+	r := ratesOf(3e-6, 3.75e-6, 0.3e-6, 15e-6)
+	r.Set[pricing.TierOutput] = false
+	p := resolverPricer{r: func() pricing.Resolver { return &fixedResolver{rates: r} }}
+	if _, ok := p.Price(context.Background(), "h", "m", 1); ok {
+		t.Fatal("a rate table without output priced a ping")
+	}
+}
+
 func TestResolverPricerWithNoResolver(t *testing.T) {
 	p := resolverPricer{r: func() pricing.Resolver { return nil }}
 	if _, ok := p.Price(context.Background(), "h", "m", 1); ok {
