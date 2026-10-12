@@ -175,16 +175,23 @@ mkdir -p "$WORK/home"
 (cd "$WORK" && HOME="$WORK/home" HTTPS_PROXY="" HTTP_PROXY="" https_proxy="" http_proxy="" \
   exec "$WORK/cortex" --config "$WORK/config.yaml") >"$WORK/cortex.log" 2>&1 &
 CORTEX_PID=$!
+# --noproxy '*' on every plain-http call below is deliberate: a lowercase
+# http_proxy in the developer's own shell (unlike HTTP_PROXY, cleared above
+# only for the cortex process) would otherwise route these health/readiness/
+# session-API calls through the shared live Cortex instead of this script's
+# own private one.
 for _ in $(seq 1 100); do
-  curl -sf "http://127.0.0.1:$HEALTH_PORT/healthz" >/dev/null 2>&1 && break
+  curl -sf --noproxy '*' "http://127.0.0.1:$HEALTH_PORT/healthz" >/dev/null 2>&1 && break
   kill -0 "$CORTEX_PID" 2>/dev/null || die "cortex exited during startup"
   sleep 0.1
 done
-curl -sf "http://127.0.0.1:$HEALTH_PORT/healthz" >/dev/null || die "cortex health endpoint never came up"
+curl -sf --noproxy '*' "http://127.0.0.1:$HEALTH_PORT/healthz" >/dev/null || die "cortex health endpoint never came up"
+fake_ready=0
 for _ in $(seq 1 50); do
-  curl -sf -o /dev/null "http://127.0.0.1:$FAKE_PORT/" -X POST -d '' 2>/dev/null && break
+  curl -sf --noproxy '*' -o /dev/null "http://127.0.0.1:$FAKE_PORT/" -X POST -d '' 2>/dev/null && { fake_ready=1; break; }
   sleep 0.1
 done
+[[ "$fake_ready" == "1" ]] || die "fake upstream on :$FAKE_PORT never became ready within 5s"
 : >"$WORK/upstream.jsonl" # drop the readiness probe
 pass "cortex healthy (forward :$FWD_PORT, session API :$SESS_PORT, fake upstream :$FAKE_PORT)"
 
@@ -246,7 +253,7 @@ fi
 
 # 7. The ping must not have come back through cortex as a recorded request.
 sleep 1
-curl -sf "http://127.0.0.1:$SESS_PORT/v1/sessions/$SID" >/dev/null \
+curl -sf --noproxy '*' "http://127.0.0.1:$SESS_PORT/v1/sessions/$SID" >/dev/null \
   || die "session API has no session $SID"
 counts=$(python3 - "$SESS_PORT" "$SID" <<'PY'
 import json, sys, urllib.parse, urllib.request
