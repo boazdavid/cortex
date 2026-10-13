@@ -38,6 +38,7 @@ import (
 	_ "github.com/rossoctl/context-guru/components/offload"  // register offload components
 	_ "github.com/rossoctl/context-guru/components/reformat" // register reformat components
 	cgconfig "github.com/rossoctl/context-guru/config"
+	"github.com/rossoctl/context-guru/dispatch"
 	"github.com/rossoctl/context-guru/keepalive"
 	cgstore "github.com/rossoctl/context-guru/store"
 )
@@ -235,10 +236,8 @@ func (p *ContextGuru) Configure(raw json.RawMessage) error {
 	if p.cfg.KeepAlive.Enabled {
 		p.kaPol = p.cfg.KeepAlive.policy()
 		p.disp = newCortexDispatcher(newPingClient())
-		p.keeper = keepalive.New(keepalive.Options{
-			Dispatcher: p.disp,
-			Prices:     resolverPricer{r: func() pricing.Resolver { return p.rates }},
-		})
+		p.disp.rates = func() pricing.Resolver { return p.rates }
+		p.keeper = keepalive.New(keepalive.Options{Dispatcher: p.disp})
 		slog.Warn("context-guru keep-alive enabled: idle sessions are pinged on the caller's own "+
 			"credential, and that spend is logged but does not reach Cortex's cost ledger",
 			"idle", p.kaPol.Idle, "maxPings", p.kaPol.MaxPings, "maxUSDPerPing", p.kaPol.MaxUSDPerPing,
@@ -376,11 +375,10 @@ func (p *ContextGuru) OnFinish(_ context.Context, pctx *pipeline.Context) {
 		return
 	}
 	sid := sessionID(pctx)
-	key := keepalive.Key{Session: sid}
 	hdr := pctx.Headers
 	scheme, host := pctx.Scheme, pctx.Host
 	disp := p.disp
-	r, ok := recordFor(pctx, sid, p.kaPol, func() { disp.hold(key, scheme, host, hdr) })
+	r, ok := recordFor(pctx, sid, p.kaPol, func() dispatch.Ref { return disp.hold(scheme, host, hdr) })
 	if !ok {
 		return
 	}

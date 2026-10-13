@@ -3,47 +3,45 @@ package contextguru
 import (
 	"bytes"
 	"context"
-	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
-	"github.com/rossoctl/context-guru/credmask"
-	"github.com/rossoctl/context-guru/keepalive"
-	"github.com/tidwall/gjson"
+	"github.com/rossoctl/context-guru/dispatch"
+	"github.com/rossoctl/cortex/core/cost/pricing"
 )
 
-// authHeaderNames are the slots a provider credential arrives in. Held masked, per thread, only
-// while the keeper tracks that thread (keepalive.Record.Hold), and zeroized on Release.
+// authHeaderNames are the slots a provider credential arrives in. Held masked, per hold, only
+// while the keeper tracks that entry (keepalive.Record.Hold), and zeroized on Release.
 var authHeaderNames = []string{"Authorization", "x-api-key", "x-goog-api-key"}
 
-var errNotHeld = errors.New("context-guru keep-alive: no upstream held for this session")
-
-// maxPingResponse bounds how much of a ping's response is read. A ping is non-streaming with a
-// tiny output budget, so its body is a few hundred bytes; the cap only guards a misbehaving
-// upstream.
-const maxPingResponse = 1 << 20
-
-// cortexDispatcher is the plugin's keepalive.Dispatcher: transport and credential custody only.
-// The credential is the one the request carried when it left Cortex's pipeline — after any
-// token-exchange or credential-injection plugin ran — because OnFinish reads pctx.Headers then.
+// cortexDispatcher is the plugin's dispatch.Dispatcher: transport and credential custody only,
+// for every call the engine's core makes (keep-alive pings today). The credential is the one the
+// request carried when it left Cortex's pipeline — after any token-exchange or
+// credential-injection plugin ran — because OnFinish reads pctx.Headers then.
 //
-// Lock order: hold and Release run under the keeper's lock and take d.mu; Dispatch runs outside
-// the keeper's lock and takes only d.mu. Nothing here calls back into the keeper.
+// Lock order: hold and Release run under the keeper's lock and take d.mu; Do runs outside the
+// keeper's lock and takes only d.mu. Nothing here calls back into the keeper.
 type cortexDispatcher struct {
 	client *http.Client
-	mu     sync.Mutex
-	held   map[keepalive.Key]heldTarget
+	// rates resolves pricing.Resolver on every call: SetPricingResolver may run after Configure,
+	// and a reload hands a new instance a new resolver (see Price).
+	rates func() pricing.Resolver
+
+	mu   sync.Mutex
+	next uint64
+	held map[dispatch.Ref]heldTarget
 }
 
 type heldTarget struct {
 	scheme, host string
-	auth         []credmask.Header
+	auth         []heldHeader
 }
 
 func newCortexDispatcher(c *http.Client) *cortexDispatcher {
-	return &cortexDispatcher{client: c, held: map[keepalive.Key]heldTarget{}}
+	return &cortexDispatcher{client: c, held: map[dispatch.Ref]heldTarget{}}
 }
 
 // newPingClient is a standalone client that never routes through HTTPS_PROXY — a ping sent back
@@ -62,15 +60,15 @@ func newPingClient() *http.Client {
 	}
 }
 
-// hold captures the upstream and the credential a finished request carried, masked. It replaces
-// (and zeroizes) whatever was held for key before.
-func (d *cortexDispatcher) hold(key keepalive.Key, scheme, host string, reqHeaders http.Header) {
-	var auth []credmask.Header
+// hold captures the upstream and the credential a finished request carried, masked, and returns
+// the Ref the keeper gives back to Do and Release.
+func (d *cortexDispatcher) hold(scheme, host string, reqHeaders http.Header) dispatch.Ref {
+	var auth []heldHeader
 	for _, name := range authHeaderNames {
 		for _, v := range reqHeaders.Values(name) {
 			b := []byte(v)
-			credmask.Mask(b)
-			auth = append(auth, credmask.Header{Name: name, Val: b})
+			credMask(b)
+			auth = append(auth, heldHeader{name: name, val: b})
 		}
 	}
 	if scheme == "" {
@@ -78,10 +76,10 @@ func (d *cortexDispatcher) hold(key keepalive.Key, scheme, host string, reqHeade
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if prev, ok := d.held[key]; ok {
-		zeroAll(prev.auth)
-	}
-	d.held[key] = heldTarget{scheme: scheme, host: host, auth: auth}
+	d.next++
+	ref := dispatch.Ref("cortex:" + strconv.FormatUint(d.next, 10))
+	d.held[ref] = heldTarget{scheme: scheme, host: host, auth: auth}
+	return ref
 }
 
 // Close releases the ping client's idle connections. Called from Shutdown so a hot-reloaded
@@ -91,80 +89,124 @@ func (d *cortexDispatcher) Close() {
 }
 
 // Release runs under the keeper's lock: zeroize and forget, nothing else.
-func (d *cortexDispatcher) Release(key keepalive.Key) {
+func (d *cortexDispatcher) Release(ref dispatch.Ref) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if h, ok := d.held[key]; ok {
-		zeroAll(h.auth)
-		delete(d.held, key)
+	if h, ok := d.held[ref]; ok {
+		zeroHeaders(h.auth)
+		delete(d.held, ref)
 	}
 }
 
-// Dispatch sends one ping on a private copy of the held credential, so a Release while the ping
-// is on the wire zeroizes the held bytes without touching the ones being sent.
-func (d *cortexDispatcher) Dispatch(ctx context.Context, req keepalive.DispatchRequest) (keepalive.Usage, int, error) {
+// Do sends one request on a private copy of the held credential, so a Release while it is on the
+// wire zeroizes the held bytes without touching the ones being sent.
+func (d *cortexDispatcher) Do(ctx context.Context, req dispatch.Request) (dispatch.Response, error) {
 	d.mu.Lock()
-	h, ok := d.held[req.Key]
-	var auth []credmask.Header
+	h, ok := d.held[req.Ref]
+	var auth []heldHeader
 	if ok {
-		auth = make([]credmask.Header, len(h.auth))
+		auth = make([]heldHeader, len(h.auth))
 		for i, a := range h.auth {
-			auth[i] = a.Clone()
+			auth[i] = a.clone()
 		}
 	}
 	d.mu.Unlock()
-	defer zeroAll(auth)
+	defer zeroHeaders(auth)
 	if !ok || h.host == "" {
-		return keepalive.Usage{}, 0, errNotHeld
+		return dispatch.Response{}, dispatch.ErrNotHeld
 	}
-	// The body is copied: the keeper zeroizes req.Body once Dispatch returns.
-	hreq, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		h.scheme+"://"+h.host+req.Route, bytes.NewReader(append([]byte(nil), req.Body...)))
+	method := req.Method
+	if method == "" {
+		method = http.MethodPost
+	}
+	// The body is a private copy that we wipe when the transport closes it: the core zeroizes
+	// req.Body once Do returns, and the transport may still be reading it then.
+	body := newWipeReader(req.Body)
+	hreq, err := http.NewRequestWithContext(ctx, method, h.scheme+"://"+h.host+req.Path, body)
 	if err != nil {
-		return keepalive.Usage{}, 0, err
+		body.Close()
+		return dispatch.Response{}, err
 	}
-	for name, vs := range req.Headers {
+	// wipeReader is not *bytes.Reader, so http.NewRequest cannot auto-detect its length from the
+	// type switch it uses for that — left unset, the request goes out chunked, which some minimal
+	// HTTP servers (reading by Content-Length only, never dechunking) see as an empty body.
+	hreq.ContentLength = int64(len(req.Body))
+	for name, vs := range req.Header {
 		hreq.Header[name] = append([]string(nil), vs...)
 	}
 	hreq.Header.Set(sentinelHeader, "1")
+	// Unmask as late as possible and wipe the buffer at once. The value becomes a Go string in
+	// the header map, which cannot be overwritten — so this bounds the plaintext to this request
+	// rather than eliminating it.
 	for _, a := range auth {
-		credmask.Mask(a.Val)
-		hreq.Header.Add(a.Name, string(a.Val))
-		credmask.Zero(a.Val)
+		credMask(a.val)
+		hreq.Header.Add(a.name, string(a.val))
+		credZero(a.val)
 	}
 	resp, err := d.client.Do(hreq)
 	if err != nil {
-		return keepalive.Usage{}, 0, err
+		return dispatch.Response{}, err
 	}
 	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxPingResponse))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, dispatch.MaxResponseBytes))
 	if err != nil {
-		return keepalive.Usage{}, resp.StatusCode, err
+		return dispatch.Response{Status: resp.StatusCode}, err
 	}
-	return pingUsage(raw), resp.StatusCode, nil
+	return dispatch.Response{Status: resp.StatusCode, Header: resp.Header.Clone(), Body: raw}, nil
 }
 
-func zeroAll(hs []credmask.Header) {
-	for _, a := range hs {
-		credmask.Zero(a.Val)
+// Price prices from Cortex's own rate table, so the keeper's pre-flight ceiling and the cost the
+// plugin logs are the same number (spec §9.1).
+//
+// Input, CacheRead and Output must be set: an unset rate on any of them is unknown, not free, and
+// pricing it as zero would leave the ceiling unenforced for that model. CacheWrite is the
+// exception — many tables (OpenAI's included) carry no separate cache-write rate, so an unset
+// CacheWrite falls back to the Input rate rather than making the whole ping unpriced.
+func (d *cortexDispatcher) Price(_ context.Context, endpoint, model string, promptTokens int64) (dispatch.Price, bool) {
+	if d.rates == nil || model == "" {
+		return dispatch.Price{}, false
 	}
+	res := d.rates()
+	if res == nil {
+		return dispatch.Price{}, false
+	}
+	rates, _ := res.Resolve(endpoint, model, int(promptTokens))
+	var out dispatch.Price
+	for _, t := range []struct {
+		tier pricing.Tier
+		dst  *float64
+	}{
+		{pricing.TierInput, &out.Input},
+		{pricing.TierCacheRead, &out.CacheRead}, {pricing.TierOutput, &out.Output},
+	} {
+		v, ok := rates.For(t.tier)
+		if !ok {
+			return dispatch.Price{}, false
+		}
+		*t.dst = v
+	}
+	if v, ok := rates.For(pricing.TierCacheWrite); ok {
+		out.CacheWrite = v
+	} else {
+		out.CacheWrite = out.Input
+	}
+	return out, true
 }
 
-// pingUsage reads a ping's non-streaming response (pings always send stream:false). Anthropic's
-// input_tokens excludes the cached tiers; OpenAI Responses' input_tokens includes cached_tokens,
-// so fresh is the difference — the same rule the engine's own proxy applies.
-func pingUsage(raw []byte) keepalive.Usage {
-	u := gjson.GetBytes(raw, "usage")
-	if cached := u.Get("input_tokens_details.cached_tokens"); cached.Exists() {
-		in, c := u.Get("input_tokens").Int(), cached.Int()
-		return keepalive.Usage{FreshInput: max(in-c, 0), CacheRead: c, Output: u.Get("output_tokens").Int()}
-	}
-	return keepalive.Usage{
-		FreshInput:   u.Get("input_tokens").Int(),
-		CacheRead:    u.Get("cache_read_input_tokens").Int(),
-		CacheWrite:   u.Get("cache_creation_input_tokens").Int(),
-		CacheWrite1h: u.Get("cache_creation.ephemeral_1h_input_tokens").Int(),
-		Output:       u.Get("output_tokens").Int(),
-		StopReason:   gjson.GetBytes(raw, "stop_reason").String(),
-	}
+// wipeReader is a request body over a private copy of the caller's bytes, zeroed on Close. The
+// transport always closes a request body, and only once it has finished reading it.
+type wipeReader struct {
+	*bytes.Reader
+	buf  []byte
+	once sync.Once
+}
+
+func newWipeReader(b []byte) *wipeReader {
+	buf := append([]byte(nil), b...)
+	return &wipeReader{Reader: bytes.NewReader(buf), buf: buf}
+}
+
+func (w *wipeReader) Close() error {
+	w.once.Do(func() { credZero(w.buf) })
+	return nil
 }

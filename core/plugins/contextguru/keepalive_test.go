@@ -7,6 +7,7 @@ import (
 
 	bschemas "github.com/maximhq/bifrost/core/schemas"
 	cgconfig "github.com/rossoctl/context-guru/config"
+	"github.com/rossoctl/context-guru/dispatch"
 	"github.com/rossoctl/cortex/core/pipeline"
 )
 
@@ -52,7 +53,7 @@ func finishTurns(t *testing.T, p *ContextGuru, n int) {
 
 func TestRecordForMapsAFinishedRequest(t *testing.T) {
 	pol := keepAliveConfig{Enabled: true}.policy()
-	r, ok := recordFor(finishedPctx(200, pipeline.AgentRoleMain), "s1", pol, func() {})
+	r, ok := recordFor(finishedPctx(200, pipeline.AgentRoleMain), "s1", pol, func() dispatch.Ref { return "" })
 	if !ok {
 		t.Fatal("a finished main-thread request was not recorded")
 	}

@@ -1,53 +1,47 @@
 package contextguru
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"testing"
+	"time"
 
+	bschemas "github.com/maximhq/bifrost/core/schemas"
+	"github.com/rossoctl/context-guru/dispatch"
+	"github.com/rossoctl/context-guru/dispatch/dispatchtest"
 	"github.com/rossoctl/context-guru/keepalive"
-	"github.com/rossoctl/context-guru/keepalive/keepalivetest"
+	"github.com/rossoctl/cortex/core/cost/pricing"
 )
 
 func TestCortexDispatcherMeetsTheContract(t *testing.T) {
-	keepalivetest.RunDispatcherContract(t, func(t *testing.T, upstreamURL string) keepalivetest.Harness {
-		u, err := url.Parse(upstreamURL)
-		if err != nil {
-			t.Fatal(err)
-		}
+	dispatchtest.Contract(t, func(t *testing.T, upstreamURL string) dispatchtest.Harness {
 		d := newCortexDispatcher(http.DefaultClient)
-		return keepalivetest.Harness{D: d, Hold: func(k keepalive.Key, h http.Header) {
-			d.hold(k, u.Scheme, u.Host, h)
+		return dispatchtest.Harness{D: d, Hold: func(h http.Header) dispatch.Ref {
+			return d.hold("http", stripScheme(upstreamURL), h)
 		}}
 	})
 }
 
-func TestPingUsageReadsBothDialects(t *testing.T) {
-	anth := pingUsage([]byte(`{"usage":{"input_tokens":3,"cache_read_input_tokens":48000,` +
-		`"cache_creation_input_tokens":0,"output_tokens":1}}`))
-	if anth.FreshInput != 3 || anth.CacheRead != 48000 || anth.CacheWrite != 0 || anth.Output != 1 {
-		t.Errorf("anthropic usage = %+v", anth)
+// stripScheme is url.Parse's .Host, inlined: the contract hands us a full "http://host:port"
+// URL and hold wants scheme and host apart.
+func stripScheme(u string) string {
+	const p = "http://"
+	if len(u) > len(p) && u[:len(p)] == p {
+		return u[len(p):]
 	}
-	// Responses: input_tokens INCLUDES the cached part; fresh is the difference.
-	resp := pingUsage([]byte(`{"usage":{"input_tokens":48003,` +
-		`"input_tokens_details":{"cached_tokens":48000},"output_tokens":16}}`))
-	if resp.FreshInput != 3 || resp.CacheRead != 48000 || resp.Output != 16 {
-		t.Errorf("responses usage = %+v", resp)
-	}
+	return u
 }
 
 func TestDispatchSetsTheSentinel(t *testing.T) {
 	// A ping that transits this proxy must short-circuit OnRequest, not be recorded again.
 	var got http.Header
 	srv := newHeaderSink(t, &got)
-	u, _ := url.Parse(srv.URL)
 	d := newCortexDispatcher(http.DefaultClient)
-	key := keepalive.Key{Tenant: "", Session: "s"}
-	d.hold(key, u.Scheme, u.Host, http.Header{"Authorization": {"Bearer k"}})
-	if _, _, err := d.Dispatch(t.Context(), keepalive.DispatchRequest{Key: key, Route: "/v1/messages",
-		Body: []byte(`{}`), Headers: http.Header{}}); err != nil {
+	ref := d.hold("http", stripScheme(srv.URL), http.Header{"Authorization": {"Bearer k"}})
+	if _, err := d.Do(context.Background(), dispatch.Request{Ref: ref, Path: "/v1/messages",
+		Body: []byte(`{}`)}); err != nil {
 		t.Fatal(err)
 	}
 	if got.Get(sentinelHeader) == "" {
@@ -101,19 +95,149 @@ func TestPingClientDoesNotFollowRedirects(t *testing.T) {
 	}))
 	t.Cleanup(srv1.Close)
 
-	u, _ := url.Parse(srv1.URL)
 	d := newCortexDispatcher(newPingClient())
-	key := keepalive.Key{Tenant: "", Session: "s"}
-	d.hold(key, u.Scheme, u.Host, http.Header{"x-api-key": {"secret"}})
-	_, status, err := d.Dispatch(t.Context(), keepalive.DispatchRequest{Key: key, Route: "/v1/messages",
-		Body: []byte(`{}`), Headers: http.Header{}})
+	ref := d.hold("http", stripScheme(srv1.URL), http.Header{"x-api-key": {"secret"}})
+	resp, err := d.Do(context.Background(), dispatch.Request{Ref: ref, Path: "/v1/messages", Body: []byte(`{}`)})
 	if err != nil {
-		t.Fatalf("Dispatch returned an error for a 307 response: %v", err)
+		t.Fatalf("Do returned an error for a 307 response: %v", err)
 	}
-	if status != http.StatusTemporaryRedirect {
-		t.Fatalf("status = %d, want %d (the ping client must not follow the redirect)", status, http.StatusTemporaryRedirect)
+	if resp.Status != http.StatusTemporaryRedirect {
+		t.Fatalf("status = %d, want %d (the ping client must not follow the redirect)", resp.Status, http.StatusTemporaryRedirect)
 	}
 	if srv2Hit {
 		t.Fatal("the ping client followed the redirect to the second host; a credential header would leak there")
+	}
+}
+
+// Every path that drops a keep-alive entry releases its credential; Shutdown drops them all. After
+// it, the plugin must hold no caller credential at all.
+func TestShutdownReleasesEveryHeldRef(t *testing.T) {
+	d := newCortexDispatcher(http.DefaultClient)
+	now := time.Date(2026, 10, 13, 12, 0, 0, 0, time.UTC)
+	k := keepalive.New(keepalive.Options{Dispatcher: d, Now: func() time.Time { return now },
+		Go: func(f func()) { f() }})
+	hdr := http.Header{"Authorization": {"Bearer sk-caller"}}
+	for i, s := range []string{"s1", "s1", "s2", "s2"} { // a session's FIRST request is not tracked
+		key := keepalive.Key{Session: s}
+		k.Record(keepalive.Record{Key: key, StartedAt: now.Add(time.Duration(i) * time.Second),
+			Body:     []byte(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`),
+			Provider: bschemas.Anthropic,
+			Endpoint: "api.anthropic.com", Route: "/v1/messages", Status: http.StatusOK,
+			Usage: keepalive.Usage{CacheRead: 48576}, UsageOK: true,
+			Policy: keepalive.Policy{KeepAlive: true, Idle: 280 * time.Second, MaxPings: 2,
+				MaxUSDPerPing: 0.25, MinPrefixTokens: 20000},
+			Header: hdr, Hold: func() dispatch.Ref { return d.hold("https", "api.anthropic.com", hdr) }})
+	}
+	d.mu.Lock()
+	held := len(d.held)
+	d.mu.Unlock()
+	if held != 2 {
+		t.Fatalf("held %d credentials for two tracked sessions, want 2", held)
+	}
+	k.Shutdown()
+	d.mu.Lock()
+	held = len(d.held)
+	d.mu.Unlock()
+	if held != 0 {
+		t.Fatalf("after Shutdown the plugin still holds %d credentials", held)
+	}
+}
+
+// --- pricer tests (resolverPricer folded into cortexDispatcher.Price) -------------------------
+
+type fixedResolver struct {
+	rates  pricing.Rates
+	gotEP  string
+	gotTok int
+}
+
+func (f *fixedResolver) Resolve(ep, _ string, promptTotal int) (pricing.Rates, pricing.Provenance) {
+	f.gotEP, f.gotTok = ep, promptTotal
+	return f.rates, pricing.ProvNone
+}
+func (f *fixedResolver) CurrencyFor(string, string) string { return "USD" }
+
+func ratesOf(in, cw, cr, out float64) pricing.Rates {
+	var r pricing.Rates
+	for t, v := range map[pricing.Tier]float64{pricing.TierInput: in, pricing.TierCacheWrite: cw,
+		pricing.TierCacheRead: cr, pricing.TierOutput: out} {
+		r.Base[t], r.Set[t] = v, true
+	}
+	return r
+}
+
+func TestDispatcherPriceMapsTiersAndPassesEndpointAndPrefix(t *testing.T) {
+	f := &fixedResolver{rates: ratesOf(3e-6, 3.75e-6, 0.3e-6, 15e-6)}
+	d := &cortexDispatcher{rates: func() pricing.Resolver { return f }}
+	price, ok := d.Price(context.Background(), "api.anthropic.com", "claude-sonnet-5", 48_000)
+	if !ok {
+		t.Fatal("priced model reported unpriced")
+	}
+	if price.Input != 3e-6 || price.CacheWrite != 3.75e-6 || price.CacheRead != 0.3e-6 || price.Output != 15e-6 {
+		t.Fatalf("price = %+v", price)
+	}
+	if f.gotEP != "api.anthropic.com" || f.gotTok != 48_000 {
+		t.Fatalf("Resolve got (%q, %d)", f.gotEP, f.gotTok)
+	}
+}
+
+func TestDispatcherPriceUnsetTierIsUnpriced(t *testing.T) {
+	r := ratesOf(3e-6, 3.75e-6, 0.3e-6, 15e-6)
+	r.Set[pricing.TierCacheRead] = false
+	d := &cortexDispatcher{rates: func() pricing.Resolver { return &fixedResolver{rates: r} }}
+	if _, ok := d.Price(context.Background(), "h", "m", 1); ok {
+		t.Fatal("a rate table without cache-read priced a ping")
+	}
+}
+
+func TestDispatcherPriceUnsetCacheWriteFallsBackToInput(t *testing.T) {
+	r := ratesOf(3e-6, 3.75e-6, 0.3e-6, 15e-6)
+	r.Set[pricing.TierCacheWrite] = false
+	d := &cortexDispatcher{rates: func() pricing.Resolver { return &fixedResolver{rates: r} }}
+	price, ok := d.Price(context.Background(), "h", "m", 1)
+	if !ok {
+		t.Fatal("a rate table with only cache-write unset left the ping unpriced")
+	}
+	if price.CacheWrite != price.Input {
+		t.Fatalf("CacheWrite = %v, want it to fall back to Input = %v", price.CacheWrite, price.Input)
+	}
+}
+
+func TestDispatcherPriceUnsetOutputIsUnpriced(t *testing.T) {
+	r := ratesOf(3e-6, 3.75e-6, 0.3e-6, 15e-6)
+	r.Set[pricing.TierOutput] = false
+	d := &cortexDispatcher{rates: func() pricing.Resolver { return &fixedResolver{rates: r} }}
+	if _, ok := d.Price(context.Background(), "h", "m", 1); ok {
+		t.Fatal("a rate table without output priced a ping")
+	}
+}
+
+func TestDispatcherPriceWithNoResolver(t *testing.T) {
+	d := &cortexDispatcher{rates: func() pricing.Resolver { return nil }}
+	if _, ok := d.Price(context.Background(), "h", "m", 1); ok {
+		t.Fatal("nil resolver priced a ping")
+	}
+}
+
+// A wipeReader is not *bytes.Reader, so http.NewRequest cannot auto-detect its length — Do must
+// set ContentLength itself, or the ping goes out chunked. That matters beyond style: a minimal
+// HTTP server (this project's own live-verification fake upstream included) reads a request body
+// by Content-Length and never dechunks, so an unset length delivers it an empty body.
+func TestDoSetsContentLengthRatherThanChunking(t *testing.T) {
+	var gotCL string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotCL = r.Header.Get("Content-Length")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer srv.Close()
+	d := newCortexDispatcher(http.DefaultClient)
+	ref := d.hold("http", stripScheme(srv.URL), http.Header{})
+	body := []byte(`{"model":"m","max_tokens":1,"stream":false}`)
+	if _, err := d.Do(context.Background(), dispatch.Request{Ref: ref, Path: "/v1/messages", Body: body}); err != nil {
+		t.Fatal(err)
+	}
+	if gotCL == "" {
+		t.Fatal("ping went out with no Content-Length header (chunked instead)")
 	}
 }

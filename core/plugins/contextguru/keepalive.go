@@ -4,6 +4,7 @@ import (
 	"time"
 
 	cgconfig "github.com/rossoctl/context-guru/config"
+	"github.com/rossoctl/context-guru/dispatch"
 	"github.com/rossoctl/context-guru/keepalive"
 	"github.com/rossoctl/cortex/core/pipeline"
 	"github.com/rossoctl/cortex/core/plugins/internal/parsercommon"
@@ -48,7 +49,7 @@ func (c keepAliveConfig) policy() keepalive.Policy {
 // is worth tracking is the keeper's call. The one filter here is about identity, not policy —
 // Cortex knows a request is a subagent's but not WHICH subagent, so recording it would replace the
 // main thread's entry (engine #423). Subagent caches are therefore not kept warm.
-func recordFor(pctx *pipeline.Context, sid string, pol keepalive.Policy, hold func()) (keepalive.Record, bool) {
+func recordFor(pctx *pipeline.Context, sid string, pol keepalive.Policy, hold func() dispatch.Ref) (keepalive.Record, bool) {
 	inf := pctx.Extensions.Inference
 	if sid == "" || inf == nil || inf.AgentRole == pipeline.AgentRoleSubagent {
 		return keepalive.Record{}, false
