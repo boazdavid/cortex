@@ -131,6 +131,10 @@ type Context struct {
 	// requestid.go for why it is lazy rather than a constructor argument.
 	requestID string
 
+	// resendReasons are the reasons Resenders named, in order, for each resend this
+	// request has had. See MarkResend.
+	resendReasons []string
+
 	// client and clientParsed memoize ClientInfo's answer.
 	//
 	// A separate flag rather than a nil check on client, because nil IS a valid

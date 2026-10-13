@@ -110,6 +110,18 @@
 // substitute it was given, so a conversation never changes model part-way when a
 // refusal lapses or a newer model is listed. A request already sent with a
 // substitute is never sent again: a refused substitute reaches the agent.
+//
+// A model the router sends to can have a smaller output limit or context window than
+// the one the agent was built for. A refusal that states the limit — Bedrock's,
+// Anthropic's and vLLM's wording, behind LiteLLM — is learned for the server and model,
+// kept in the durable store for 30 days, and the request is fitted and sent again
+// before the agent sees the refusal. Later requests are fitted before they are sent:
+// the output field is lowered, never raised, nor to or below the body's
+// thinking.budget_tokens; and once an Anthropic messages or OpenAI chat-completions
+// request passes 85% of the window its oldest turns after the first user message are
+// dropped to under 60%, with a note saying how many. A responses-format request only
+// has its output field lowered, as does one with a single turn larger than the window. Only requests the router switched — to another host or another model — are fitted, and each kind of
+// refusal is resent at most once per request.
 package inferencerouter
 
 import (
@@ -350,6 +362,7 @@ func (p *Router) OnRequest(_ context.Context, pctx *pipeline.Context) pipeline.A
 	// The model is chosen only once the request has moved, so an observed router
 	// changes nothing.
 	p.chooseModel(pctx, name)
+	p.applyLimits(pctx, name, true)
 	pin.settle(name)
 	if addressed != name {
 		dropProviderCredentials(pctx.Headers)

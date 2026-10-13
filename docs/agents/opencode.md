@@ -286,6 +286,14 @@ offered by OpenCode once it has a Zen key: any value in `OPENCODE_API_KEY` will
 do, since the router replaces it. A session already running on Zen when OpenCode
 is routed stays on Zen.
 
+If the server's model has a smaller output limit or context window than the model
+the agent asked for, the router lowers the request's output limit (unless that would
+not leave it above an extended-thinking budget) and, near the window, drops the oldest
+turns, keeping the task and the recent turns. Turns are dropped from Anthropic messages
+and OpenAI chat-completions requests only; a responses-format request has only its
+output limit lowered. The agent's own view of the conversation is not changed. See the inference-router's Limits rule in
+`docs/plugin-catalog.md`.
+
 ## Verified depth
 
 Tested live with OpenCode 2.0.21 on macOS 26.6 (arm64) and Cortex built from the change

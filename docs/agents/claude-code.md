@@ -187,6 +187,14 @@ Nothing fails over. When a session's server is down its requests fail, with a 50
 from the proxy when the server cannot be reached; route the agent to another
 server, and start a new session there.
 
+If the server's model has a smaller output limit or context window than the model
+the agent asked for, the router lowers the request's output limit (unless that would
+not leave it above an extended-thinking budget) and, near the window, drops the oldest
+turns, keeping the task and the recent turns. Turns are dropped from Anthropic messages
+and OpenAI chat-completions requests only; a responses-format request has only its
+output limit lowered. The agent's own view of the conversation is not changed. See the inference-router's Limits rule in
+`docs/plugin-catalog.md`.
+
 **`/model` may list a server's own names.** If Claude Code asks the gateway for its
 model list, that request is routed like the rest, so the picker can show, say,
 `glm-5.3`. A name chosen there goes to the server as it is, like any other.

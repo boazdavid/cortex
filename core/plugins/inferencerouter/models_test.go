@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -15,6 +16,7 @@ import (
 	"github.com/rossoctl/cortex/core/pipeline"
 	"github.com/rossoctl/cortex/core/plugins"
 	"github.com/rossoctl/cortex/core/plugins/inferencerouter/routerconfig"
+	"github.com/tidwall/gjson"
 
 	// The laptop's outbound chain, which the router joins last.
 	_ "github.com/rossoctl/cortex/core/plugins/a2aparser"
@@ -623,5 +625,222 @@ func TestResend_TreatsAnUnrestrictedKeysInvalidModelAsARefusal(t *testing.T) {
 	run(t, p, pctx)
 	if resend(p, pctx, http.StatusBadRequest, `{"error":{"message":"max_tokens is too large"}}`) {
 		t.Error("Resend = true for a 400 of another kind")
+	}
+}
+
+const bedrockCap = `{"error":{"message":"litellm.BadRequestError: BedrockException - {\"message\":\"The maximum tokens you requested exceeds the model limit of 128000. Try again with a maximum tokens value that is lower than 128000.\"}","type":null,"param":null,"code":"400"}}`
+
+// withOutput gives pctx's body an output field, as OpenCode sends it.
+func withOutput(t *testing.T, pctx *pipeline.Context, n int) {
+	t.Helper()
+	m, _ := pctx.RequestModel()
+	pctx.Body = []byte(`{"model":"` + m + `","max_completion_tokens":` + strconv.Itoa(n) + `,"messages":[{"role":"user","content":"hi"}]}`)
+}
+
+func TestResend_LearnsAnOutputCapAndSendsTheRequestCapped(t *testing.T) {
+	store := newStore(t)
+	_, p := buildRouter(t, wordConfig(`"opencode": "glm"`))
+	pctx := chat(store, "opencode.ai", "/zen/v1/chat/completions", opencodeUA, "s1", glmMain, true)
+	withOutput(t, pctx, 256000)
+	run(t, p, pctx)
+
+	if !resend(p, pctx, http.StatusBadRequest, bedrockCap) {
+		t.Fatal("Resend = false for a refusal that states the output cap")
+	}
+	if got := gjson.GetBytes(pctx.Body, "max_completion_tokens").Int(); got != 128000 {
+		t.Errorf("max_completion_tokens = %d, want 128000", got)
+	}
+	assertRecord(t, pctx, pipeline.ActionModify, "resent",
+		map[string]string{"server": "glm", "model": glmMain, "limit": "output", "value": "128000", "stated": "true"})
+
+	// The next request of the session is capped before it is sent.
+	next := chat(store, "opencode.ai", "/zen/v1/chat/completions", opencodeUA, "s1", glmMain, true)
+	withOutput(t, next, 256000)
+	run(t, p, next)
+	if got := gjson.GetBytes(next.Body, "max_completion_tokens").Int(); got != 128000 {
+		t.Errorf("next request's max_completion_tokens = %d, want 128000 before sending", got)
+	}
+	// applyLimits records before the router's modify/routed, so find it by reason.
+	var capped *pipeline.Invocation
+	for i, inv := range next.Extensions.Invocations.Outbound {
+		if inv.Plugin == Name && inv.Reason == "output_capped" {
+			capped = &next.Extensions.Invocations.Outbound[i]
+		}
+	}
+	if capped == nil {
+		t.Fatalf("timeline = %v, want modify/output_capped", outboundReasons(next))
+	}
+	for k, want := range map[string]string{"field": "max_completion_tokens", "from": "256000", "to": "128000"} {
+		if got := capped.Details[k]; got != want {
+			t.Errorf("output_capped %s = %q, want %q", k, got, want)
+		}
+	}
+}
+
+// A first request can be refused twice — the model, then a limit — and the agent
+// sees neither; a third refusal is the agent's.
+func TestResend_AModelRefusalThenALimitRefusalAreBothAbsorbed(t *testing.T) {
+	store := newStore(t)
+	_, p := buildRouter(t, wordConfig(`"opencode": "glm"`))
+	pctx := chat(store, "opencode.ai", "/zen/v1/chat/completions", opencodeUA, "s1", "exo-free", true)
+	withOutput(t, pctx, 256000)
+	run(t, p, pctx)
+
+	if !resend(p, pctx, http.StatusForbidden, refusal) {
+		t.Fatal("the model refusal was not resent")
+	}
+	if !resend(p, pctx, http.StatusBadRequest, bedrockCap) {
+		t.Fatal("the limit refusal after a model resend was not resent")
+	}
+	if got := pctx.ResendReasons(); !slices.Equal(got, []string{"model", "limit"}) {
+		t.Errorf("ResendReasons = %v, want [model limit]", got)
+	}
+	if resend(p, pctx, http.StatusBadRequest, bedrockCap) {
+		t.Error("a second limit refusal was resent; it must reach the agent")
+	}
+}
+
+func TestRouter_LeavesARequestItDidNotRouteAlone(t *testing.T) {
+	store := newStore(t)
+	r, p := buildRouter(t, wordConfig(`"opencode": "glm"`))
+	pctx := chat(store, "glm.example.com", "/v1/chat/completions", "curl/8.0", "s1", glmMain, true)
+	r.saveLimits(pctx, "glm", glmMain, limits{Output: 1000, Window: 100})
+	withOutput(t, pctx, 256000)
+	before := string(pctx.Body)
+	run(t, p, pctx)
+	if string(pctx.Body) != before {
+		t.Errorf("body = %s, want an unrouted request unchanged", pctx.Body)
+	}
+	if resend(p, pctx, http.StatusBadRequest, bedrockCap) {
+		t.Error("an unrouted request was resent")
+	}
+}
+
+func TestRouter_TrimsARoutedConversationNearTheWindow(t *testing.T) {
+	store := newStore(t)
+	r, p := buildRouter(t, wordConfig(`"opencode": "glm"`))
+	pctx := chat(store, "opencode.ai", "/zen/v1/chat/completions", opencodeUA, "s1", glmMain, true)
+	r.saveLimits(pctx, "glm", glmMain, limits{Window: 1000})
+	long := []string{user("the task")}
+	for i := 0; i < 6; i++ {
+		long = append(long, asst(pad), user(pad))
+	}
+	pctx.Body = []byte(`{"model":"` + glmMain + `","messages":[` + strings.Join(long, ",") + `]}`)
+	run(t, p, pctx)
+
+	if n := len(gjson.GetBytes(pctx.Body, "messages").Array()); n >= len(long) {
+		t.Errorf("messages = %d, want fewer than the %d sent", n, len(long))
+	}
+	var trimmed bool
+	for _, reason := range outboundReasons(pctx) {
+		trimmed = trimmed || reason == "modify/context_trimmed"
+	}
+	if !trimmed {
+		t.Errorf("timeline = %v, want modify/context_trimmed", outboundReasons(pctx))
+	}
+}
+
+const bedrockTooLong = `{"error":{"message":"litellm.BadRequestError: BedrockException - {\"message\":\"Input is too long for requested model.\"}","type":null,"param":null,"code":"400"}}`
+
+func TestResend_ALimitRefusalStatingNoNumberLearnsAWindowBelowTheRequest(t *testing.T) {
+	store := newStore(t)
+	r, p := buildRouter(t, wordConfig(`"opencode": "glm"`))
+	pctx := chat(store, "opencode.ai", "/zen/v1/chat/completions", opencodeUA, "s1", glmMain, true)
+	var msgs []string
+	for i := 0; i < 40; i++ {
+		msgs = append(msgs, `{"role":"user","content":"`+pad+`"}`, `{"role":"assistant","content":"`+pad+`"}`)
+	}
+	msgs = append(msgs, `{"role":"user","content":"last"}`)
+	pctx.Body = []byte(`{"model":"` + glmMain + `","max_completion_tokens":1000,"messages":[` + strings.Join(msgs, ",") + `]}`)
+	run(t, p, pctx)
+
+	refused := append([]byte(nil), pctx.Body...)
+	if !resend(p, pctx, http.StatusBadRequest, bedrockTooLong) {
+		t.Fatal("Resend = false for a limit refusal that states no number")
+	}
+	want := estimate(refused) * 9 / 10
+	assertRecord(t, pctx, pipeline.ActionModify, "resent",
+		map[string]string{"server": "glm", "model": glmMain, "limit": "window", "value": strconv.Itoa(want), "stated": "false"})
+	if got := r.loadLimits(pctx, "glm", glmMain).Window; got != want {
+		t.Errorf("learned window = %d, want %d", got, want)
+	}
+}
+
+// Two conversations in one session — the main thread and a subagent — each keep their
+// own cut, so one's recut does not move the other's.
+func TestRouter_EachConversationKeepsItsOwnCut(t *testing.T) {
+	store := newStore(t)
+	r, p := buildRouter(t, wordConfig(`"opencode": "glm"`))
+	send := func(first string, turns int, text string) *pipeline.Context {
+		pctx := chat(store, "opencode.ai", "/zen/v1/chat/completions", opencodeUA, "s1", glmMain, true)
+		msgs := []string{user(first)}
+		for i := 0; i < turns; i++ {
+			msgs = append(msgs, asst(text), user(text))
+		}
+		pctx.Body = []byte(`{"model":"` + glmMain + `","messages":[` + strings.Join(msgs, ",") + `]}`)
+		r.saveLimits(pctx, "glm", glmMain, limits{Window: 1000})
+		run(t, p, pctx)
+		return pctx
+	}
+	dropped := func(pctx *pipeline.Context) string {
+		for _, inv := range pctx.Extensions.Invocations.Outbound {
+			if inv.Reason == "context_trimmed" {
+				return inv.Details["dropped"]
+			}
+		}
+		return ""
+	}
+	// The subagent's messages are longer, so its cut lands later than the main
+	// thread's — at an index that is a valid cut in the main thread too.
+	main1 := dropped(send("the main task", 9, pad))
+	send("a subagent's task", 9, pad+pad)
+	if main2 := dropped(send("the main task", 9, pad)); main2 != main1 {
+		t.Errorf("main thread dropped %s after a subagent's request, want its own cut kept (%s)", main2, main1)
+	}
+}
+
+// An agent that talks to a server serving its own model, at the host it named, was
+// not switched: the router leaves its limits to the agent.
+func TestRouter_DoesNotFitARequestThatWasNotSwitched(t *testing.T) {
+	store := newStore(t)
+	r, p := buildRouter(t, wordConfig(`"opencode": "glm"`))
+	pctx := chat(store, "glm.example.com:8443", "/v1/chat/completions", opencodeUA, "s1", glmMain, true)
+	r.saveLimits(pctx, "glm", glmMain, limits{Output: 1000, Window: 100})
+	withOutput(t, pctx, 256000)
+	before := string(pctx.Body)
+	run(t, p, pctx)
+	if !pctx.Redirected() {
+		t.Fatal("the request was not routed; the test needs a routed request that was not switched")
+	}
+	if string(pctx.Body) != before {
+		t.Errorf("body = %s, want a request that was not switched unchanged", pctx.Body)
+	}
+	if resend(p, pctx, http.StatusBadRequest, bedrockCap) {
+		t.Error("a limit refusal of a request that was not switched was resent")
+	}
+}
+
+// A limit is read from the server's error message, and only a number that makes sense
+// for the refused request is learned.
+func TestResend_LearnsOnlyAPlausibleLimitFromTheErrorMessage(t *testing.T) {
+	for _, tc := range []struct{ name, body string }{
+		{"a limit quoted from the request's own text", `{"error":{"message":"invalid request","detail":[{"input":"maximum context length is 64 tokens"}]}}`},
+		{"a window below any real model's", `{"error":{"message":"This model's maximum context length is 64 tokens."}}`},
+		{"an output cap below any real model's", `{"error":{"message":"The maximum tokens you requested exceeds the model limit of 5."}}`},
+		{"an output cap above what was asked for", `{"error":{"message":"The maximum tokens you requested exceeds the model limit of 300000."}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newStore(t)
+			r, p := buildRouter(t, wordConfig(`"opencode": "glm"`))
+			pctx := chat(store, "opencode.ai", "/zen/v1/chat/completions", opencodeUA, "s1", glmMain, true)
+			withOutput(t, pctx, 256000)
+			run(t, p, pctx)
+			if resend(p, pctx, http.StatusBadRequest, tc.body) {
+				t.Error("the request was resent on an implausible limit")
+			}
+			if got := r.loadLimits(pctx, "glm", glmMain); got != (limits{}) {
+				t.Errorf("learned %+v, want nothing", got)
+			}
+		})
 	}
 }

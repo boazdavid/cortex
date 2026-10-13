@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -156,13 +158,65 @@ func (p *Router) chooseModel(pctx *pipeline.Context, server string) {
 	}
 }
 
-// Resend implements pipeline.Resender. When the server a request was routed to
+// Resend implements pipeline.Resender. A refusal of the model the agent asked for is
+// answered with the server's substitute, as resendForModel says; a refusal for a
+// limit teaches the router that limit for the model, and the request is fitted and
+// sent again. Each kind is answered at most once per request.
+func (p *Router) Resend(_ context.Context, pctx *pipeline.Context, status int, body []byte) bool {
+	if refusesModel(status, body) {
+		return p.resendForModel(pctx)
+	}
+	if kind, n, ok := limitRefusal(status, body); ok {
+		return p.resendForLimit(pctx, kind, n)
+	}
+	return false
+}
+
+// resendForLimit learns a refusal's limit for the model a routed request was sent
+// with and fits the request to it. A refusal that states no number teaches a window
+// 90% of the request's estimate, which is below what the server refused.
+func (p *Router) resendForLimit(pctx *pipeline.Context, kind limitKind, n int) bool {
+	if !switched(pctx) || slices.Contains(pctx.ResendReasons(), "limit") {
+		return false
+	}
+	server, ok := p.byHost[routerconfig.Hostname(pctx.Host)]
+	if !ok {
+		return false
+	}
+	model, ok := pctx.RequestModel()
+	if !ok {
+		return false
+	}
+	stated := n > 0
+	if !stated {
+		n = estimate(pctx.Body) * 9 / 10
+	}
+	if !plausible(kind, n, pctx.Body) {
+		return false
+	}
+	p.saveLimits(pctx, server, model, p.loadLimits(pctx, server, model).learn(kind, n))
+	which := "window"
+	if kind == limitOutput {
+		which = "output"
+	}
+	details := map[string]string{"server": server, "model": model, "limit": which,
+		"value": strconv.Itoa(n), "stated": strconv.FormatBool(stated)}
+	if !p.applyLimits(pctx, server, false) {
+		pctx.Record(pipeline.Invocation{Action: pipeline.ActionSkip, Reason: "limit_not_fitted", Details: details})
+		return false
+	}
+	pctx.Record(pipeline.Invocation{Action: pipeline.ActionModify, Reason: "resent", Details: details})
+	pctx.MarkResend("limit")
+	return true
+}
+
+// resendForModel answers a model refusal. When the server a request was routed to
 // refused the model the agent asked for, the refusal is recorded for refusedFor, and
 // the request is sent again with the server's substitute, before the agent sees
 // anything. A request already sent with a substitute is never sent again, so a
 // refused substitute reaches the agent as the server answered it.
-func (p *Router) Resend(_ context.Context, pctx *pipeline.Context, status int, body []byte) bool {
-	if !refusesModel(status, body) || !pctx.Redirected() {
+func (p *Router) resendForModel(pctx *pipeline.Context) bool {
+	if !pctx.Redirected() {
 		return false
 	}
 	server, ok := p.byHost[routerconfig.Hostname(pctx.Host)]
@@ -188,6 +242,7 @@ func (p *Router) Resend(_ context.Context, pctx *pipeline.Context, status int, b
 	p.keepSubstitute(pctx, server, requested, sub)
 	details["substitute"] = sub
 	pctx.Record(pipeline.Invocation{Action: pipeline.ActionModify, Reason: "resent", Details: details})
+	pctx.MarkResend("model")
 	return true
 }
 

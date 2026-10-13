@@ -1075,49 +1075,55 @@ func setBody(r *http.Request, body []byte) {
 	r.Header.Del("Content-Encoding")
 }
 
-// resendIfAsked gives the outbound pipeline's Resenders the one look at a refused
-// answer that pipeline.Resender promises, and sends the request again when one asks.
-// It returns the answer to relay: resp itself, or the second send's.
+// resendIfAsked gives the outbound pipeline's Resenders a look at each refused answer,
+// at most pipeline.MaxResends times, and sends the request again when one asks. It
+// returns the answer to relay: resp itself, or the last send's.
 //
 // Only a request whose body the pipeline buffered can be sent again, and only a
 // Resender's request could need it, so nothing is read from an answer unless a
 // Resender is in the chain. A refused answer that is sent again is recorded on its own
-// response row, and the second send on a request row of its own under a new request
+// response row, and each further send on a request row of its own under a new request
 // id, so the timeline shows both attempts and each pairs with its own answer. A
 // refused answer that is not sent again goes to the client byte for byte, the bytes
 // read for the Resender included.
 func (s *Server) resendIfAsked(r *http.Request, pctx *pipeline.Context, client *http.Client, resp *http.Response, tl *tunnelLog, ownEncoding bool) (*http.Response, error) {
-	if resp.StatusCode/100 == 2 || !s.OutboundPipeline.HasResenders() || !s.OutboundPipeline.NeedsRequestBody() {
+	if !s.OutboundPipeline.HasResenders() || !s.OutboundPipeline.NeedsRequestBody() {
 		return resp, nil
 	}
-	head, _ := io.ReadAll(io.LimitReader(resp.Body, pipeline.ResendPeekLimit))
-	// The parse as the refused attempt was sent: a Resender may rewrite the model,
-	// and the refused attempt's row must name the one the upstream refused.
-	sent := pipeline.SnapshotInference(pctx.Extensions.Inference)
-	if !s.OutboundPipeline.Resend(r.Context(), pctx, resp.StatusCode, head) {
-		resp.Body = struct {
-			io.Reader
-			io.Closer
-		}{io.MultiReader(bytes.NewReader(head), resp.Body), resp.Body}
-		return resp, nil
+	for round := 0; round < pipeline.MaxResends && resp.StatusCode/100 != 2; round++ {
+		head, _ := io.ReadAll(io.LimitReader(resp.Body, pipeline.ResendPeekLimit))
+		// The parse as the refused attempt was sent: a Resender may rewrite the model,
+		// and the refused attempt's row must name the one the upstream refused.
+		sent := pipeline.SnapshotInference(pctx.Extensions.Inference)
+		if !s.OutboundPipeline.Resend(r.Context(), pctx, resp.StatusCode, head) {
+			resp.Body = struct {
+				io.Reader
+				io.Closer
+			}{io.MultiReader(bytes.NewReader(head), resp.Body), resp.Body}
+			return resp, nil
+		}
+		_ = resp.Body.Close()
+		if s.Sessions != nil {
+			// The refused answer's row: its status and error, from the bytes read. Put
+			// back at once, because the status of the answer the client gets is the
+			// one OutcomeFromContext must read.
+			resent := pctx.Extensions.Inference
+			pctx.StatusCode, pctx.ResponseBody, pctx.Extensions.Inference = resp.StatusCode, head, sent
+			s.recordOutboundResponseEvent(pctx, resp.StatusCode, nil)
+			pctx.StatusCode, pctx.ResponseBody, pctx.Extensions.Inference = 0, nil, resent
+			pctx.RenewRequestID()
+			s.recordOutboundRequestEvent(tl, pctx, pctx.OutboundSessionID)
+		}
+		again := r.Clone(r.Context())
+		syncHeaders(again, pctx.Headers)
+		setBody(again, pctx.Body)
+		stripForUpstream(again, ownEncoding)
+		var err error
+		if resp, err = client.Do(again); err != nil {
+			return nil, err
+		}
 	}
-	_ = resp.Body.Close()
-	if s.Sessions != nil {
-		// The refused answer's row: its status and error, from the bytes read. Put back
-		// at once, because the status of the answer the client gets is the one
-		// OutcomeFromContext must read.
-		resent := pctx.Extensions.Inference
-		pctx.StatusCode, pctx.ResponseBody, pctx.Extensions.Inference = resp.StatusCode, head, sent
-		s.recordOutboundResponseEvent(pctx, resp.StatusCode, nil)
-		pctx.StatusCode, pctx.ResponseBody, pctx.Extensions.Inference = 0, nil, resent
-		pctx.RenewRequestID()
-		s.recordOutboundRequestEvent(tl, pctx, pctx.OutboundSessionID)
-	}
-	again := r.Clone(r.Context())
-	syncHeaders(again, pctx.Headers)
-	setBody(again, pctx.Body)
-	stripForUpstream(again, ownEncoding)
-	return client.Do(again)
+	return resp, nil
 }
 
 func (s *Server) recordOutboundRequestEvent(tl *tunnelLog, pctx *pipeline.Context, sid string) {

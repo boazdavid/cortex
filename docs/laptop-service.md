@@ -521,6 +521,13 @@ This removes only the keys Cortex added to `~/.claude/settings.json`
 `CURL_CA_BUNDLE`) and leaves anything else in that file alone. Claude Code goes
 straight to the API again. Restart `claude` to pick it up.
 
+It also leaves alone any one of those keys whose value you have **changed since
+enable set it**, and says which: that edit is yours, and restoring what preceded
+Cortex over it would throw it away silently. Those keys are the one case where
+disable does not leave Claude Code fully unwired — a `HTTPS_PROXY` you pointed
+somewhere else still points there. Edit `~/.claude/settings.json` by hand if you
+want them gone.
+
 Cortex keeps running; nothing sends traffic to it. `agentop configure claude-code
 enable` puts it back.
 
@@ -810,6 +817,16 @@ machine you believe you have just cleaned. `agentop uninstall` removes all seven
 as `agentop configure claude-code disable` does, and `--purge` deletes `~/.cortex` last,
 and not at all if a removal before it failed; this list is only for when that binary is
 already gone.
+
+Both of them skip a key whose value you have **changed since enable set it** — that
+edit is yours to keep or drop — and say which under *Left behind*. `--purge` then keeps
+`~/.cortex` rather than walking into the hazard above: if any key is still going to name
+a file inside the directory once it has finished, the whole directory stays, and the
+`purged` row says which key. That covers a key it left behind *and* one it put back,
+because a value of your own under `~/.cortex` — a CA file you keep there yourself — is
+one enable adopts as Cortex's and uninstall hands back to you. Delete the directory
+yourself once nothing points into it. Doing the removal by hand, as this section does,
+there is nothing to do that for you — check the keys you changed before you `rm -rf`.
 
 If you configured OpenCode, its background service's environment holds the same kind of
 variables. Remove the ones that point at Cortex with the `opencode` CLI, as
