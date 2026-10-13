@@ -40,8 +40,13 @@ type heldTarget struct {
 	auth         []heldHeader
 }
 
+// newCortexDispatcher copies c and overrides CheckRedirect unconditionally, so refusing a
+// redirect is a property of this dispatcher rather than something every caller must remember by
+// passing newPingClient() — nothing else about c changes.
 func newCortexDispatcher(c *http.Client) *cortexDispatcher {
-	return &cortexDispatcher{client: c, held: map[dispatch.Ref]heldTarget{}}
+	cc := *c
+	cc.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return &cortexDispatcher{client: &cc, held: map[dispatch.Ref]heldTarget{}}
 }
 
 // newPingClient is a standalone client that never routes through HTTPS_PROXY — a ping sent back
@@ -131,6 +136,11 @@ func (d *cortexDispatcher) Do(ctx context.Context, req dispatch.Request) (dispat
 	// type switch it uses for that — left unset, the request goes out chunked, which some minimal
 	// HTTP servers (reading by Content-Length only, never dechunking) see as an empty body.
 	hreq.ContentLength = int64(len(req.Body))
+	// wipeReader is not *bytes.Reader either, so http.NewRequest cannot infer GetBody from it —
+	// and without GetBody, net/http never retries a write that failed on a reused idle
+	// connection. req.Body is still live here (the core zeroes it only after Do returns), so a
+	// fresh copy for a retry is safe to make on demand.
+	hreq.GetBody = func() (io.ReadCloser, error) { return newWipeReader(req.Body), nil }
 	for name, vs := range req.Header {
 		hreq.Header[name] = append([]string(nil), vs...)
 	}

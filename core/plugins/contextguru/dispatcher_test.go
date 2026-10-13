@@ -3,6 +3,7 @@ package contextguru
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -17,7 +18,7 @@ import (
 
 func TestCortexDispatcherMeetsTheContract(t *testing.T) {
 	dispatchtest.Contract(t, func(t *testing.T, upstreamURL string) dispatchtest.Harness {
-		d := newCortexDispatcher(http.DefaultClient)
+		d := newCortexDispatcher(newPingClient())
 		return dispatchtest.Harness{D: d, Hold: func(h http.Header) dispatch.Ref {
 			return d.hold("http", stripScheme(upstreamURL), h)
 		}}
@@ -38,7 +39,7 @@ func TestDispatchSetsTheSentinel(t *testing.T) {
 	// A ping that transits this proxy must short-circuit OnRequest, not be recorded again.
 	var got http.Header
 	srv := newHeaderSink(t, &got)
-	d := newCortexDispatcher(http.DefaultClient)
+	d := newCortexDispatcher(newPingClient())
 	ref := d.hold("http", stripScheme(srv.URL), http.Header{"Authorization": {"Bearer k"}})
 	if _, err := d.Do(context.Background(), dispatch.Request{Ref: ref, Path: "/v1/messages",
 		Body: []byte(`{}`)}); err != nil {
@@ -112,7 +113,7 @@ func TestPingClientDoesNotFollowRedirects(t *testing.T) {
 // Every path that drops a keep-alive entry releases its credential; Shutdown drops them all. After
 // it, the plugin must hold no caller credential at all.
 func TestShutdownReleasesEveryHeldRef(t *testing.T) {
-	d := newCortexDispatcher(http.DefaultClient)
+	d := newCortexDispatcher(newPingClient())
 	now := time.Date(2026, 10, 13, 12, 0, 0, 0, time.UTC)
 	k := keepalive.New(keepalive.Options{Dispatcher: d, Now: func() time.Time { return now },
 		Go: func(f func()) { f() }})
@@ -231,7 +232,7 @@ func TestDoSetsContentLengthRatherThanChunking(t *testing.T) {
 		_, _ = w.Write([]byte(`{"usage":{"input_tokens":1,"output_tokens":1}}`))
 	}))
 	defer srv.Close()
-	d := newCortexDispatcher(http.DefaultClient)
+	d := newCortexDispatcher(newPingClient())
 	ref := d.hold("http", stripScheme(srv.URL), http.Header{})
 	body := []byte(`{"model":"m","max_tokens":1,"stream":false}`)
 	if _, err := d.Do(context.Background(), dispatch.Request{Ref: ref, Path: "/v1/messages", Body: body}); err != nil {
@@ -239,5 +240,84 @@ func TestDoSetsContentLengthRatherThanChunking(t *testing.T) {
 	}
 	if gotCL == "" {
 		t.Fatal("ping went out with no Content-Length header (chunked instead)")
+	}
+}
+
+// Do's body is a wipeReader, not *bytes.Reader, so http.NewRequest cannot infer GetBody from its
+// type switch either — and without GetBody, net/http never retries a write that failed on a
+// reused idle connection. A ping fires every ~270s+, long enough that the server closing a pooled
+// connection between pings is a live concern; losing the free retry turns that into a visible
+// ping failure instead of a transparent one.
+func TestDoSetsGetBodyForTransportRetry(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer srv.Close()
+	d := newCortexDispatcher(&http.Client{})
+	ref := d.hold("http", stripScheme(srv.URL), http.Header{})
+	body := []byte(`{"model":"m","max_tokens":1,"stream":false}`)
+	captured := make(chan *http.Request, 1)
+	d.client.Transport = captureTransport{inner: http.DefaultTransport, captured: captured}
+	if _, err := d.Do(context.Background(), dispatch.Request{Ref: ref, Path: "/v1/messages", Body: body}); err != nil {
+		t.Fatal(err)
+	}
+	hreq := <-captured
+	if hreq.GetBody == nil {
+		t.Fatal("Do built a request with no GetBody; net/http cannot retry a failed write on a reused connection")
+	}
+	rc, err := hreq.GetBody()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(body) {
+		t.Fatalf("GetBody returned %q, want %q", got, body)
+	}
+}
+
+// captureTransport records the *http.Request Do actually sent, then forwards to inner.
+type captureTransport struct {
+	inner    http.RoundTripper
+	captured chan *http.Request
+}
+
+func (c captureTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	c.captured <- r
+	return c.inner.RoundTrip(r)
+}
+
+// newCortexDispatcher must refuse a redirect regardless of what client it is given — the no-
+// redirect rule is a property of this dispatcher, not of remembering to pass newPingClient().
+// production always does (plugin.go), but nothing in the constructor enforced it, and a GetBody
+// (added above) is exactly what makes a bare *http.Client start following a POST redirect: Go's
+// client cannot resend the body without GetBody and silently stops at the redirect instead, which
+// is how an unenforced caller could pass this dispatcher's own contract test by accident.
+func TestNewCortexDispatcherRefusesRedirectsEvenWithABareClient(t *testing.T) {
+	var srv2Hit bool
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		srv2Hit = true
+	}))
+	defer srv2.Close()
+	srv1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, srv2.URL, http.StatusTemporaryRedirect)
+	}))
+	defer srv1.Close()
+
+	d := newCortexDispatcher(&http.Client{}) // deliberately bare: no CheckRedirect set by the caller
+	ref := d.hold("http", stripScheme(srv1.URL), http.Header{"x-api-key": {"secret"}})
+	resp, err := d.Do(context.Background(), dispatch.Request{Ref: ref, Path: "/v1/messages", Body: []byte(`{}`)})
+	if err != nil {
+		t.Fatalf("Do returned an error for a 307 response: %v", err)
+	}
+	if resp.Status != http.StatusTemporaryRedirect {
+		t.Fatalf("status = %d, want %d (the dispatcher must not follow the redirect)", resp.Status, http.StatusTemporaryRedirect)
+	}
+	if srv2Hit {
+		t.Fatal("the dispatcher followed the redirect to the second host with a bare client; the credential header would leak there")
 	}
 }

@@ -35,7 +35,21 @@ func (m *fakeSummaryModel) CompleteMessages(context.Context, string, []bschemas.
 // exactly as through the standalone proxy's Dispatcher. Proven here by what the fake upstream
 // actually received: zero requests, because the substitute never calls cortexDispatcher.Do at
 // all — the engine's keepalive.Keeper (keepalive/substitute.go) commissions the candidate's own
-// call directly and only ever reaches the Dispatcher for Price.
+// call directly and reaches cortexDispatcher only for Price, which this test also exercises (via
+// a fixedResolver) and checks landed in Stats().SpentUSD.
+//
+// WHAT THIS DOES NOT PROVE: that this path is reachable through today's real Cortex traffic.
+// cache_aware_summarizer needs a components.MessagesModel or a components.PrefixAsker to
+// register a candidate at all (see its own doc comment), and Cortex's cgModel implements neither
+// — only Complete. So in production, as wired in plugin.go today, cache_aware_summarizer never
+// actually registers a candidate, and this substitution never fires. This test is the dispatcher
+// contract for when that changes (cgModel grows CompleteMessages, or some other MessagesModel-
+// capable component is added), exercised directly via offload.RegisterKeepAliveCandidateForTest
+// rather than by driving the real pipeline. It also does not exercise Price: a registered
+// candidate's usage counters come from cheapmodel's own instrumentation
+// (cheapmodel.WithDetachedSink), which this test's fakeSummaryModel bypasses entirely — the same
+// reason the engine's own equivalent test (keepalive/substitute_test.go) does not assert a cost
+// either.
 func TestCortexSubstitutesCacheAwareSummarizerForAPing(t *testing.T) {
 	var upstreamHits int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -58,7 +72,7 @@ func TestCortexSubstitutesCacheAwareSummarizerForAPing(t *testing.T) {
 	offload.RegisterKeepAliveCandidateForTest(session, st, call, "messages", span, 1, "", 0)
 	t.Cleanup(func() { offload.ClearKeepAliveCandidate(session) })
 
-	d := newCortexDispatcher(http.DefaultClient)
+	d := newCortexDispatcher(newPingClient())
 	now := time.Date(2026, 10, 13, 12, 0, 0, 0, time.UTC)
 	k := keepalive.New(keepalive.Options{Dispatcher: d, Now: func() time.Time { return now },
 		Go: func(f func()) { f() }})
