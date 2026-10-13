@@ -189,7 +189,13 @@ jq --arg date "${today}" \
     elif $name | test("darwin_amd64") then "darwin_amd64"
     elif $name | test("linux_arm64")  then "linux_arm64"
     elif $name | test("linux_amd64")  then "linux_amd64"
-    elif $name | test("^checksums")   then "checksums"
+    # Unanchored: v0.1 through v0.4 named this file
+    # kagenti-extensions_<ver>_checksums.txt, which an anchored ^checksums missed.
+    # Those 24 releases were filed under "other" and read 0 installs apiece -- 79
+    # downloads invisible, and the all-time total understated by 24% (257 against
+    # 338). The platform tests above come first and no published asset has ever had
+    # "checksums" in a tarball name, so widening this reclassifies nothing else.
+    elif $name | test("checksums")    then "checksums"
     else "other"
     end;
 
@@ -259,9 +265,26 @@ mkdir -p "$(dirname "${OUT}")"
 # Re-running on the same day replaces that day's snapshot instead of appending a
 # second one. Makes the job idempotent, so a manual workflow_dispatch after a
 # failed cron run is safe and leaves exactly one row per date.
+#
+# Snapshots written before the checksums pattern was unanchored are repaired on the
+# way past. Those misclassified downloads were counted -- just filed under "other"
+# instead of "checksums" -- so moving them is exact arithmetic, not a guess, and it
+# is what keeps the series continuous rather than showing a one-day jump of ~79 in a
+# column whose daily deltas are 1-5.
+#
+# Keyed on the presence of "other": a snapshot taken after the fix has none, so this
+# is a no-op from then on and needs no version flag or cutoff date. The per-release
+# figures inside each snapshot are left alone -- they are what a future reader would
+# recompute from, and they are already right under the new pattern.
 jq --slurpfile snap "${snap}" '
+  def repair:
+    if (.totals.other // 0) > 0 then
+      .totals.checksums = ((.totals.checksums // 0) + .totals.other)
+      | del(.totals.other)
+    else . end;
+
   .snapshots
-  |= ( map(select(.date != $snap[0].date)) + $snap
+  |= ( map(select(.date != $snap[0].date) | repair) + $snap
        | sort_by(.date) )
 ' "${OUT}" >"${merged}"
 
