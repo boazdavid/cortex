@@ -56,7 +56,11 @@ func (p *ContextGuru) modelsFor(pctx *pipeline.Context, provider bschemas.ModelP
 	if p.static != nil {
 		spec.Static = p.static.chargedTo(to)
 	}
-	if m := p.incomingModel(pctx, provider, api); m != nil {
+	if provider == bschemas.Anthropic {
+		if m, ok := p.anthropicIncoming(pctx, to); ok {
+			spec.Incoming = m
+		}
+	} else if m := p.incomingModel(pctx, provider, api); m != nil {
 		spec.Incoming = m.chargedTo(to)
 	}
 	return spec
