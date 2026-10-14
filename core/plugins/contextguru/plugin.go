@@ -25,6 +25,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -36,12 +37,14 @@ import (
 
 	bschemas "github.com/maximhq/bifrost/core/schemas"
 	"github.com/rossoctl/context-guru/apply"
+	"github.com/rossoctl/context-guru/cheapmodel"
 	cgcomponents "github.com/rossoctl/context-guru/components"
 	_ "github.com/rossoctl/context-guru/components/offload"  // register offload components
 	_ "github.com/rossoctl/context-guru/components/reformat" // register reformat components
 	cgconfig "github.com/rossoctl/context-guru/config"
 	"github.com/rossoctl/context-guru/dispatch"
 	"github.com/rossoctl/context-guru/keepalive"
+	"github.com/rossoctl/context-guru/proxyapp"
 	cgstore "github.com/rossoctl/context-guru/store"
 )
 
@@ -125,6 +128,8 @@ type contextGuruConfig struct {
 	Engine json.RawMessage `json:"engine"`
 	// KeepAlive is the opt-in prompt-cache keep-alive. Off unless enabled: true.
 	KeepAlive keepAliveConfig `json:"keep_alive"`
+	// ContextWindow says where model windows come from, for the engine's fraction triggers.
+	ContextWindow windowsConfig `json:"context_window"`
 }
 
 // cgModel adapts an llmclient.Client to context-guru's components.Model interface
@@ -182,6 +187,21 @@ type ContextGuru struct {
 	// costs records the money this plugin spends outside the pipeline; nil when the binary wires
 	// no recorder. See spend.go.
 	costs spend.CostRecorder
+
+	// holds sends the engine's calls on an Anthropic request's own credential, and stash keeps
+	// the last forwarded body the summarizer's prefix ask appends to; see incoming_anthropic.go.
+	// Separate from disp, which belongs to the keep-alive.
+	holds *credHolds
+	stash *sentStash
+	// pending is the body this plugin received for a session's request in flight, kept until
+	// OnFinish stashes it beside the body that went upstream.
+	pending sync.Map
+	// windows resolves a model's context window; see windows.go.
+	windows proxyapp.Resolver
+	// cgSessions maps a Cortex session id to the session key the engine derived for it
+	// (apply.Trace.Session), so OnFinish records billed input under the key OnRequest reads.
+	// One entry per session, overwritten on each request.
+	cgSessions sync.Map
 
 	// Keep-alive, all nil/zero unless keep_alive.enabled. The keeper decides when to ping; disp
 	// only sends and holds the credential.
@@ -251,6 +271,14 @@ func (p *ContextGuru) Configure(raw json.RawMessage) error {
 	}
 	p.pipe = pipe
 	p.store = cfg.NewStore()
+	p.windows = buildWindows(p.cfg.ContextWindow)
+	if p.holds != nil {
+		p.holds.releaseAll()
+		p.holds.d.Close()
+	}
+	d := newCortexDispatcher(newPingClient())
+	d.rates = func() pricing.Resolver { return p.rates }
+	p.holds, p.stash = newCredHolds(d), newSentStash()
 
 	// A keeper built here stays unstarted until Init runs. The normal lifecycle is Configure, then
 	// Init, on a fresh instance; a Configure after Init does not happen there, and a keeper it
@@ -349,9 +377,24 @@ func (p *ContextGuru) OnRequest(ctx context.Context, pctx *pipeline.Context) pip
 	provider, api := dialectFor(pctx.Path)
 	models := p.modelsFor(pctx, provider, api, sid)
 	before := len(pctx.Body)
+	window, exact := p.windowFor(ctx, pctx)
+	var asker cgcomponents.PrefixAsker
+	if cli, ok := models.Incoming.(cheapmodel.Anthropic); ok {
+		cli.MaxTokens = cheapmodel.PrefixAskMaxTokens
+		asker = prefixAsker{stash: p.stash, cli: cli}
+		if !isSubagent(pctx) {
+			// The body as this plugin received it; SetBody replaces pctx.Body rather than
+			// writing into it. OnFinish stashes it once upstream has accepted the request.
+			p.pending.Store(sid, pctx.Body)
+		}
+	}
 	res := apply.BodyOpts(ctx, p.pipe, p.store, apply.Opts{
 		Provider: provider, Body: pctx.Body, API: api, Session: sid, Models: models,
+		Window: window, WindowExact: exact, PrefixAsk: asker,
 	})
+	if res.Trace.Session != "" {
+		p.cgSessions.Store(sid, res.Trace.Session)
+	}
 	out, changed := res.Body, res.Changed
 	if changed && len(out) > 0 {
 		// Per-request byte-level view (the engine's token-level view is logged by
@@ -396,6 +439,10 @@ func (p *ContextGuru) Shutdown(context.Context) error {
 	if p.disp != nil {
 		p.disp.Close()
 	}
+	if p.holds != nil {
+		p.holds.releaseAll()
+		p.holds.d.Close()
+	}
 	return nil
 }
 
@@ -409,11 +456,17 @@ func (p *ContextGuru) OnFinish(_ context.Context, pctx *pipeline.Context) {
 	if p.stopped.Load() {
 		return
 	}
-	if p.keeper == nil || (pctx.Headers != nil && pctx.Headers.Get(sentinelHeader) != "") ||
-		!p.gated(pctx.Path) {
+	if (pctx.Headers != nil && pctx.Headers.Get(sentinelHeader) != "") || !p.gated(pctx.Path) {
 		return
 	}
 	sid := sessionID(pctx)
+	if sid != "" {
+		p.recordBilled(pctx, sid)
+		p.stashSent(pctx, sid)
+	}
+	if p.keeper == nil {
+		return
+	}
 	hdr := pctx.Headers
 	scheme, host := pctx.Scheme, pctx.Host
 	disp := p.disp
@@ -520,6 +573,7 @@ func (p *ContextGuru) ConfigSchema() []pipeline.FieldSchema {
 		{Name: "paths", Type: "[]string", Description: "Inference request paths to compact (default: chat/completions, completions, messages, responses)."},
 		{Name: "model", Type: "object", Description: "Optional static cheap model for LLM-backed components (summarize, extract:code)."},
 		{Name: "engine", Type: "object", Description: "Native context-guru config: preset / pipeline / per-component (marker_mode) / store. Default: preset xhigh."},
+		{Name: "context_window", Type: "object", Description: "Where model context windows come from, for fraction-of-window triggers (cache_aware_summarizer's 0.9): model_info (litellm | off, default litellm), model_info_url, windows (model id -> tokens, exact)."},
 		{Name: "keep_alive", Type: "object", Description: "Opt-in prompt-cache keep-alive: enabled, idle_seconds (270), max_pings (2), max_usd_per_ping (0.50), min_prefix_tokens (80000). Pings bill the caller's own credential; their spend is recorded in the cost ledger where the binary wires a cost recorder, and otherwise only logged."},
 	}
 }
