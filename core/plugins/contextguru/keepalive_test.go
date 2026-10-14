@@ -53,7 +53,7 @@ func finishTurns(t *testing.T, p *ContextGuru, n int) {
 
 func TestRecordForMapsAFinishedRequest(t *testing.T) {
 	pol := keepAliveConfig{Enabled: true}.policy()
-	r, ok := recordFor(finishedPctx(200, pipeline.AgentRoleMain), "s1", pol, func() dispatch.Ref { return "" })
+	r, ok := recordFor(finishedPctx(200, pipeline.AgentRoleMain), "s1", pol, func() dispatch.Ref { return "" }, logEmitter{})
 	if !ok {
 		t.Fatal("a finished main-thread request was not recorded")
 	}
@@ -74,7 +74,7 @@ func TestRecordForMapsAFinishedRequest(t *testing.T) {
 func TestRecordForUsageNotOKWithoutCacheTiers(t *testing.T) {
 	pctx := finishedPctx(200, pipeline.AgentRoleMain)
 	pctx.Extensions.Inference.PresentKinds = 1 | 8 // input + output only
-	r, ok := recordFor(pctx, "s1", keepAliveConfig{Enabled: true}.policy(), nil)
+	r, ok := recordFor(pctx, "s1", keepAliveConfig{Enabled: true}.policy(), nil, logEmitter{})
 	if !ok || r.UsageOK {
 		t.Fatalf("ok=%v usageOK=%v; want recorded with UsageOK false", ok, r.UsageOK)
 	}
@@ -82,15 +82,15 @@ func TestRecordForUsageNotOKWithoutCacheTiers(t *testing.T) {
 
 func TestRecordForSkipsSubagentsAndMissingInputs(t *testing.T) {
 	pol := keepAliveConfig{Enabled: true}.policy()
-	if _, ok := recordFor(finishedPctx(200, pipeline.AgentRoleSubagent), "s1", pol, nil); ok {
+	if _, ok := recordFor(finishedPctx(200, pipeline.AgentRoleSubagent), "s1", pol, nil, logEmitter{}); ok {
 		t.Error("a subagent request was recorded under the main thread's key")
 	}
-	if _, ok := recordFor(finishedPctx(200, pipeline.AgentRoleMain), "", pol, nil); ok {
+	if _, ok := recordFor(finishedPctx(200, pipeline.AgentRoleMain), "", pol, nil, logEmitter{}); ok {
 		t.Error("a request with no session was recorded")
 	}
 	p := finishedPctx(200, pipeline.AgentRoleMain)
 	p.Extensions.Inference = nil
-	if _, ok := recordFor(p, "s1", pol, nil); ok {
+	if _, ok := recordFor(p, "s1", pol, nil, logEmitter{}); ok {
 		t.Error("a request with no inference parse was recorded")
 	}
 }

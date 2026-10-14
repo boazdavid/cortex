@@ -23,11 +23,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/rossoctl/cortex/core/cost/pricing"
+	"github.com/rossoctl/cortex/core/cost/spend"
 	"github.com/rossoctl/cortex/core/llmclient"
 	"github.com/rossoctl/cortex/core/pipeline"
 	"github.com/rossoctl/cortex/core/plugins"
@@ -98,8 +100,8 @@ func (logEmitter) Run(r cgcomponents.RunReport) {
 		"tokensSaved", r.Saved(), "pctSaved", pct(r.TokensBefore, r.TokensAfter), "components", fired)
 }
 
-// KeepAlivePing logs each ping's cost. Until Cortex has a CostRecorder (spec §9.3) this log line is
-// the only record of keep-alive spend in Cortex. It carries no header and no body.
+// KeepAlivePing logs each ping's cost. It carries no header and no body. pingEmitter adds the
+// ledger record when a spend.CostRecorder is wired; without one this line is the only record.
 func (logEmitter) KeepAlivePing(r cgcomponents.KeepAliveReport) {
 	slog.Info("context-guru keep-alive ping", "session", r.Session, "model", r.Model,
 		"ping", r.Pings, "cacheRead", r.CacheRead, "cacheWrite", r.CacheWrite,
@@ -126,13 +128,26 @@ type contextGuruConfig struct {
 }
 
 // cgModel adapts an llmclient.Client to context-guru's components.Model interface
-// (single prompt in, text out).
+// (single prompt in, text out). It is the only path any engine component has to a model, so it is
+// where the plugin measures what those calls cost: host and model label the charge, and to says
+// who pays (nil: nobody records).
 type cgModel struct {
 	c         *llmclient.Client
 	maxTokens int
+	host      string
+	model     string
+	to        *chargeTo
+}
+
+// chargedTo is m with its calls charged to to.
+func (m *cgModel) chargedTo(to *chargeTo) cgModel {
+	c := *m
+	c.to = to
+	return c
 }
 
 func (m cgModel) Complete(ctx context.Context, prompt string) (string, error) {
+	start := time.Now()
 	resp, err := m.c.CallRaw(ctx, &llmclient.ChatRequest{
 		Temperature: 0,
 		MaxTokens:   m.maxTokens,
@@ -140,6 +155,12 @@ func (m cgModel) Complete(ctx context.Context, prompt string) (string, error) {
 	})
 	if err != nil {
 		return "", err
+	}
+	if u := resp.Usage; u != nil {
+		cached := u.CachedTokens()
+		m.to.record(spend.PurposeCompaction, m.host, m.model,
+			pricing.Usage{Input: u.PromptTokens - cached, CacheRead: cached, Output: u.CompletionTokens},
+			http.StatusOK, time.Now(), time.Since(start))
 	}
 	if len(resp.Choices) == 0 {
 		return "", fmt.Errorf("contextguru: model returned no choices")
@@ -154,10 +175,13 @@ type ContextGuru struct {
 	cfg      contextGuruConfig
 	pipe     *cgcomponents.Pipeline
 	store    cgstore.Store
-	static   cgcomponents.Model
+	static   *cgModel
 	modelTO  time.Duration
 	modelMax int
 	rates    pricing.Resolver
+	// costs records the money this plugin spends outside the pipeline; nil when the binary wires
+	// no recorder. See spend.go.
+	costs spend.CostRecorder
 
 	// Keep-alive, all nil/zero unless keep_alive.enabled. The keeper decides when to ping; disp
 	// only sends and holds the credential.
@@ -238,10 +262,18 @@ func (p *ContextGuru) Configure(raw json.RawMessage) error {
 		p.disp = newCortexDispatcher(newPingClient())
 		p.disp.rates = func() pricing.Resolver { return p.rates }
 		p.keeper = keepalive.New(keepalive.Options{Dispatcher: p.disp})
-		slog.Warn("context-guru keep-alive enabled: idle sessions are pinged on the caller's own "+
-			"credential, and that spend is logged but does not reach Cortex's cost ledger",
-			"idle", p.kaPol.Idle, "maxPings", p.kaPol.MaxPings, "maxUSDPerPing", p.kaPol.MaxUSDPerPing,
-			"minPrefixTokens", p.kaPol.MinPrefixTokens)
+		args := []any{"idle", p.kaPol.Idle, "maxPings", p.kaPol.MaxPings, "maxUSDPerPing", p.kaPol.MaxUSDPerPing,
+			"minPrefixTokens", p.kaPol.MinPrefixTokens}
+		if p.costs == nil {
+			// A WARN, not a refusal, until the binaries wire a recorder: refusing would turn keep-alive
+			// off everywhere. See docs/superpowers/specs/2026-10-14-contextguru-savings-and-spend-design.md §2.4.
+			slog.Warn("context-guru keep-alive enabled: idle sessions are pinged on the caller's own "+
+				"credential, and with no cost recorder wired that spend is logged but does not reach "+
+				"Cortex's cost ledger", args...)
+		} else {
+			slog.Info("context-guru keep-alive enabled: idle sessions are pinged on the caller's own "+
+				"credential, and that spend is reported to the cost recorder", args...)
+		}
 	}
 
 	// Model timeouts / caps (shared by static + incoming clients).
@@ -264,7 +296,7 @@ func (p *ContextGuru) Configure(raw json.RawMessage) error {
 			// would silently disable the cheap model. Fail loud instead.
 			return fmt.Errorf("context-guru model config: base_url and model must both be set (got base_url=%q model=%q)", m.BaseURL, m.Model)
 		default:
-			p.static = cgModel{
+			p.static = &cgModel{
 				c: llmclient.New(llmclient.Options{
 					Endpoint:           m.BaseURL,
 					Model:              m.Model,
@@ -273,6 +305,8 @@ func (p *ContextGuru) Configure(raw json.RawMessage) error {
 					SentinelHeaderName: sentinelHeader,
 				}),
 				maxTokens: p.modelMax,
+				host:      hostOf(m.BaseURL),
+				model:     m.Model,
 			}
 		}
 	}
@@ -310,7 +344,7 @@ func (p *ContextGuru) OnRequest(ctx context.Context, pctx *pipeline.Context) pip
 		return cont
 	}
 	provider, api := dialectFor(pctx.Path)
-	models := cgcomponents.ModelSpec{Static: p.static, Incoming: p.incomingModel(pctx, provider, api)}
+	models := p.modelsFor(pctx, provider, api, sid)
 	before := len(pctx.Body)
 	res := apply.BodyOpts(ctx, p.pipe, p.store, apply.Opts{
 		Provider: provider, Body: pctx.Body, API: api, Session: sid, Models: models,
@@ -322,9 +356,11 @@ func (p *ContextGuru) OnRequest(ctx context.Context, pctx *pipeline.Context) pip
 		// The message follows this plugin's own SetBody result, not BodyMutated: under
 		// on_error: observe the write is a shadow and the client's body goes upstream.
 		msg := "context-guru rewrote request body"
-		if !pctx.SetBody(out) {
+		applied := pctx.SetBody(out)
+		if !applied {
 			msg = "context-guru would rewrite request body (on_error: observe, not applied)"
 		}
+		publishSaving(pctx, savingEventFrom(before, len(out), applied, res.Trace))
 		slog.Info(msg,
 			"provider", provider, "path", pctx.Path, "session", sid,
 			"bytesBefore", before, "bytesAfter", len(out), "pctSaved", pct(before, len(out)))
@@ -378,7 +414,8 @@ func (p *ContextGuru) OnFinish(_ context.Context, pctx *pipeline.Context) {
 	hdr := pctx.Headers
 	scheme, host := pctx.Scheme, pctx.Host
 	disp := p.disp
-	r, ok := recordFor(pctx, sid, p.kaPol, func() dispatch.Ref { return disp.hold(scheme, host, hdr) })
+	r, ok := recordFor(pctx, sid, p.kaPol, func() dispatch.Ref { return disp.hold(scheme, host, hdr) },
+		p.pingEmitter(pctx, sid))
 	if !ok {
 		return
 	}
@@ -420,7 +457,7 @@ func dialectFor(path string) (bschemas.ModelProvider, string) {
 // instructions+input shape); returns nil for anthropic, for api == "responses", or
 // when the pieces aren't present, in which case the engine falls back to the
 // static model or degrades to deterministic.
-func (p *ContextGuru) incomingModel(pctx *pipeline.Context, provider bschemas.ModelProvider, api string) cgcomponents.Model {
+func (p *ContextGuru) incomingModel(pctx *pipeline.Context, provider bschemas.ModelProvider, api string) *cgModel {
 	if provider != bschemas.OpenAI || api == "responses" || pctx.Host == "" {
 		return nil
 	}
@@ -436,7 +473,7 @@ func (p *ContextGuru) incomingModel(pctx *pipeline.Context, provider bschemas.Mo
 	if pctx.Headers != nil {
 		bearer = strings.TrimPrefix(pctx.Headers.Get("Authorization"), "Bearer ")
 	}
-	return cgModel{
+	return &cgModel{
 		c: llmclient.New(llmclient.Options{
 			Endpoint:           scheme + "://" + pctx.Host,
 			Model:              model,
@@ -445,6 +482,8 @@ func (p *ContextGuru) incomingModel(pctx *pipeline.Context, provider bschemas.Mo
 			SentinelHeaderName: sentinelHeader,
 		}),
 		maxTokens: p.modelMax,
+		host:      pctx.Host,
+		model:     model,
 	}
 }
 
@@ -478,7 +517,7 @@ func (p *ContextGuru) ConfigSchema() []pipeline.FieldSchema {
 		{Name: "paths", Type: "[]string", Description: "Inference request paths to compact (default: chat/completions, completions, messages, responses)."},
 		{Name: "model", Type: "object", Description: "Optional static cheap model for LLM-backed components (summarize, extract:code)."},
 		{Name: "engine", Type: "object", Description: "Native context-guru config: preset / pipeline / per-component (marker_mode) / store."},
-		{Name: "keep_alive", Type: "object", Description: "Opt-in prompt-cache keep-alive: enabled, idle_seconds (270), max_pings (2), max_usd_per_ping (0.50), min_prefix_tokens (80000). Pings bill the caller's own credential; their spend is logged, not in the cost ledger."},
+		{Name: "keep_alive", Type: "object", Description: "Opt-in prompt-cache keep-alive: enabled, idle_seconds (270), max_pings (2), max_usd_per_ping (0.50), min_prefix_tokens (80000). Pings bill the caller's own credential; their spend is recorded in the cost ledger where the binary wires a cost recorder, and otherwise only logged."},
 	}
 }
 
@@ -487,8 +526,10 @@ var (
 	_ pipeline.Configurable         = (*ContextGuru)(nil)
 	_ pipeline.SchemaProvider       = (*ContextGuru)(nil)
 	_ pricing.ResolverConsumer      = (*ContextGuru)(nil)
+	_ spend.RecorderConsumer        = (*ContextGuru)(nil)
 	_ pipeline.Initializer          = (*ContextGuru)(nil)
 	_ pipeline.Shutdowner           = (*ContextGuru)(nil)
 	_ pipeline.Finisher             = (*ContextGuru)(nil)
 	_ cgcomponents.KeepAliveEmitter = logEmitter{}
+	_ cgcomponents.KeepAliveEmitter = pingEmitter{}
 )
