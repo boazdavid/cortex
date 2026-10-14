@@ -265,6 +265,23 @@ func capUA(s string) string {
 // it.
 var knownClients = map[string]string{
 	"claude-cli": "claude-code",
+	// THE SAME AGENT UNDER ITS OTHER PRODUCT TOKEN, which until #1363 was a value in this
+	// map but never a key — so the lookup missed and ~13% of one capture's Claude Code
+	// events pooled into agentop's catch-all Other row with their spend, while
+	// IsKnownAgent said false for them wherever that gates. Claude Code sends both shapes
+	// on live traffic, and they look like different COMPONENTS rather than
+	// interactive-vs-headless, since both name claude-vscode and agent-sdk:
+	//
+	//	claude-cli/2.1.233 (external, claude-vscode, agent-sdk/0.3.233)
+	//	claude-code/2.1.233 (claude-vscode, agent-sdk/0.3.233)
+	//
+	// Unlike claude-cli, this key IS the canonical name — the token Claude Code sends here
+	// is already its product name, so there is no third spelling to invent.
+	//
+	// Captured 2026-10-13 from Claude Code 2.1.233. This does NOT claim the third shape,
+	// "Claude-User (claude-code/…)"; see TestParseUserAgent_ClaudeUserIsNotClaimed and
+	// AffinityName's doc comment for why that one stays unrecognised.
+	"claude-code": "claude-code",
 	// bob-shell IS the canonical name here, unlike claude-cli above: the product token Bob
 	// Shell sends is already its product name, so renaming it would invent a third spelling
 	// beside the binary (`bob`) and the IDE ("IBM Bob"). It arrives with its own detection
@@ -299,6 +316,49 @@ var knownClients = map[string]string{
 	// see productVersion. It arrives with its own detection work: its session header is
 	// session.SessionIDHeader, and `agentop configure opencode` sets it up.
 	"opencode": "opencode",
+	// Codex, which the paragraph above named as waiting for its own detection work. That work
+	// is here: inferenceparser reads its Responses API dialect, and `agentop configure codex`
+	// sets it up by writing ~/.codex/.env.
+	//
+	// THE PRODUCT TOKEN IS "codex_exec", WITH AN UNDERSCORE, not "codex" — which is why the key
+	// is not the canonical name, as with claude-cli. Codex sends two forms of it, differing only
+	// by a trailing "(codex_exec; <version>)" comment:
+	//
+	//	codex_exec/0.160.1 (Mac OS 26.3.0; arm64) unknown (codex_exec; 0.160.1)
+	//	codex_exec/0.160.1 (Mac OS 26.3.0; arm64) unknown
+	//
+	// One entry covers both: the token is FIRST in each, so ParseUserAgent's first rule matches
+	// and the trailing scan is never reached. Both carry the version where it is expected, so
+	// productVersion needs no case for this agent. Captured 2026-10-08 from Codex 0.160.1 on
+	// macOS, on /backend-api/codex/responses among others.
+	"codex_exec": "codex",
+	// Codex's MCP client, a separate product token on the same release, seen on
+	// /backend-api/ps/mcp: "codex-mcp-client/0.160.1". Folded to the same canonical name
+	// deliberately — it is one agent's component rather than a second agent, so its traffic
+	// belongs in Codex's row and its session, the way OpenCode's service and TUI share one.
+	"codex-mcp-client": "codex",
+	// THE INTERACTIVE TUI, which is what `agentop configure codex enable` sends people to
+	// ("run `codex` as usual"), so omitting these two covered the documented path and
+	// missed the default one. Codex's User-Agent is "{originator}/{version} (…)", and the
+	// originator is whatever client_name the app-server was initialized with: the TUI
+	// passes "codex-tui", while anything sent BEFORE that initialize completes uses the
+	// built-in default "codex_cli_rs". Both are Codex, so both fold here. Read off
+	// Codex's source at rust-v0.160.1 (tui/src/lib.rs, app-server's
+	// initialize_processor.rs, login/src/auth/default_client.rs) and both tokens
+	// confirmed present in the shipped 0.160.1 binary.
+	"codex-tui":    "codex",
+	"codex_cli_rs": "codex",
+	// NOT CLAIMED, though the same binary carries them as originator names:
+	// "codex_vscode", "codex_desktop", "codex-app-server", "codex_mcp_server",
+	// "codex-cli". The first two plausibly belong to separate products the way IBM Bob
+	// the IDE does to Bob Shell, and none of the five has been seen on live traffic or
+	// traced to a client_name the way the four above have. An unrecognised agent still
+	// shows under its raw User-Agent and can be added later; a wrong fold is silent.
+	// NOT CLAIMED: "OTel-OTLP-Exporter-Rust/0.31.0", which Codex's telemetry sends to
+	// ab.chatgpt.com/otlp/v1/metrics. The token names the generic Rust OTLP exporter, not
+	// Codex, so claiming it would file every Rust program using that crate under Codex's
+	// name — the mis-mapping this map's godoc calls worse than no answer. It carries no
+	// inference either.
 }
 
 // IsKnownAgent reports whether name is the canonical name of a coding agent ParseUserAgent

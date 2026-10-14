@@ -212,6 +212,130 @@ func TestParseUserAgent_IBMBobIDEShellIsNotClaimed(t *testing.T) {
 	}
 }
 
+// Codex's two product tokens both fold to one canonical name, and its telemetry exporter
+// stays unrecognised. All four strings captured live from Codex 0.160.1 on macOS.
+//
+// The two codex_exec forms differ only by a trailing "(codex_exec; <version>)" comment, so
+// this pins that the comment changes nothing: the token is first in both, which is the
+// parser's first rule, and the version comes off that token rather than out of the comment.
+func TestParseUserAgent_Codex(t *testing.T) {
+	for _, tc := range []struct{ ua, name, version string }{
+		{"codex_exec/0.160.1 (Mac OS 26.3.0; arm64) unknown (codex_exec; 0.160.1)", "codex", "0.160.1"},
+		{"codex_exec/0.160.1 (Mac OS 26.3.0; arm64) unknown", "codex", "0.160.1"},
+		// Codex's MCP client: a different token, the same agent, so the same row.
+		{"codex-mcp-client/0.160.1", "codex", "0.160.1"},
+		// The interactive TUI, and the default originator for anything Codex sends
+		// before its app-server initialize completes. Both are what `configure codex
+		// enable` actually sends people to, so both must fold to the same row as exec.
+		{"codex-tui/0.160.1 (Mac OS 26.3.0; arm64) unknown", "codex", "0.160.1"},
+		{"codex_cli_rs/0.160.1 (Mac OS 26.3.0; arm64) unknown", "codex", "0.160.1"},
+		// Originator names the same binary carries but that nothing has tied to live
+		// Codex traffic. Deliberately unclaimed; see knownClients.
+		{"codex_vscode/0.160.1", "", ""},
+		{"codex_desktop/0.160.1", "", ""},
+		// Its telemetry exporter names the generic Rust OTLP crate, not Codex. Claiming it
+		// would file every Rust program using that crate under Codex's name.
+		{"OTel-OTLP-Exporter-Rust/0.31.0", "", ""},
+	} {
+		got := ParseUserAgent(tc.ua)
+		if got == nil {
+			t.Fatalf("ParseUserAgent(%q) = nil, want a client", tc.ua)
+		}
+		if got.Name != tc.name || got.Version != tc.version {
+			t.Errorf("ParseUserAgent(%q) = {Name: %q, Version: %q}, want {%q, %q}",
+				tc.ua, got.Name, got.Version, tc.name, tc.version)
+		}
+	}
+}
+
+// Claude Code's three live User-Agents, and which of them is claimed.
+//
+// THE REFERENCE INTEGRATION, which is why the gap here was the expensive one: claude-code was
+// a VALUE in knownClients and never a KEY, so the second shape below went unrecognised and
+// pooled into agentop's catch-all Other row with its spend, while IsKnownAgent said false for
+// it wherever that gates (#1363). The same class of bug as Codex's above — one agent, more
+// than one product token, a lookup table covering only some of them — so the two tests sit
+// together deliberately.
+//
+// All three captured 2026-10-13 from Claude Code 2.1.233, verbatim, with the measured split
+// 469 / 70 / 12 events. Version is asserted on both claimed shapes because a labeling fix
+// that got the version wrong would still fragment the series.
+func TestParseUserAgent_ClaudeCodeSendsTwoClaimedProductTokens(t *testing.T) {
+	for _, tc := range []struct{ name, ua string }{
+		// The CLI binary. Matched before the fix, and here as the control: without it a
+		// map-entry-only implementation looks fully covered by the row below.
+		{"cli", "claude-cli/2.1.233 (external, claude-vscode, agent-sdk/0.3.233)"},
+		// The Agent-SDK-shaped UA. This is the row the fix adds; both name claude-vscode
+		// and agent-sdk, so they read as different components of one install rather than
+		// interactive-vs-headless.
+		{"agent sdk", "claude-code/2.1.233 (claude-vscode, agent-sdk/0.3.233)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ParseUserAgent(tc.ua)
+			if got == nil {
+				t.Fatalf("ParseUserAgent(%q) = nil, want a client", tc.ua)
+			}
+			if got.Name != "claude-code" {
+				t.Errorf("Name = %q, want %q", got.Name, "claude-code")
+			}
+			if got.Version != "2.1.233" {
+				t.Errorf("Version = %q, want %q", got.Version, "2.1.233")
+			}
+			// The assertion that decides whether these two are one row or two: Label is
+			// the usage aggregator's series key and what ledger.Row.Agent stores.
+			if want := "claude-code/2.1.233"; got.Label() != want {
+				t.Errorf("Label() = %q, want %q — this is the series key, so a mismatch here IS the fragmentation", got.Label(), want)
+			}
+			// IsKnownAgent gates core/cost/usage, so an unrecognised shape is excluded
+			// from spend as well as mislabeled.
+			if !IsKnownAgent(got.Name) {
+				t.Errorf("IsKnownAgent(%q) = false, want true", got.Name)
+			}
+		})
+	}
+}
+
+// Claude Code's WebFetch User-Agent stays UNRECOGNISED, and that is deliberate rather than the
+// remainder of #1363.
+//
+// Reading an agent's name out of a COMMENT into Name would move these rows to a different
+// agent in the ledger and the AGENTS pane than the history beside them — AffinityName's doc
+// comment is where that reasoning lives. The fix for the Agent-SDK token must not widen to
+// this one, and nothing about adding a "claude-code" KEY does: the first token here is
+// "Claude-User", and the trailing scan cuts on "/" without trimming punctuation, so the later
+// token reads as "(claude-code" and misses. That is incidental to the parser's shape rather
+// than a rule it states, which is exactly why it is pinned here.
+//
+// Attribution is unaffected and is asserted below: AffinityName scans comments against
+// canonical NAMES, so a header-less WebFetch call still joins Claude Code's session.
+func TestParseUserAgent_ClaudeUserIsNotClaimed(t *testing.T) {
+	const ua = "Claude-User (claude-code/2.1.233; +https://support.anthropic.com/)"
+	got := ParseUserAgent(ua)
+	if got == nil {
+		t.Fatalf("ParseUserAgent(%q) = nil, want a client", ua)
+	}
+	if got.Name != "" {
+		t.Errorf("Name = %q, want unrecognised — naming a row from a comment is the behaviour this pins against", got.Name)
+	}
+	if got.Version != "" {
+		t.Errorf("Version = %q, want empty", got.Version)
+	}
+	// Unaffected by the labeling fix: session grouping reads comments on purpose.
+	if affinity := got.AffinityName(); affinity != "claude-code" {
+		t.Errorf("AffinityName() = %q, want claude-code — attribution must still join Claude Code's session", affinity)
+	}
+}
+
+// Session attribution follows the recognised name rather than the comment scan for Codex:
+// AffinityName short-circuits on Name, so the "(codex_exec; 0.160.1)" comment — whose token
+// is the map KEY and not the canonical name — never has to match for this to work.
+func TestAffinityName_CodexUsesTheRecognisedName(t *testing.T) {
+	c := ParseUserAgent("codex_exec/0.160.1 (Mac OS 26.3.0; arm64) unknown (codex_exec; 0.160.1)")
+	if got := c.AffinityName(); got != "codex" {
+		t.Errorf("AffinityName() = %q, want codex", got)
+	}
+}
+
 // IsKnownAgent answers for canonical names only: what AgentName folds a recognised Label to.
 func TestIsKnownAgent(t *testing.T) {
 	for _, tc := range []struct {
@@ -222,9 +346,12 @@ func TestIsKnownAgent(t *testing.T) {
 		{"bob-shell", true},
 		{"ibm-bob", true},
 		{"opencode", true},
+		{"codex", true},
 		// A product token is not a canonical name: claude-cli is how Claude Code is RECOGNISED.
 		{"claude-cli", false},
 		{"bob", false},
+		{"codex_exec", false},
+		{"codex-mcp-client", false},
 		// Versioned labels have to be folded first; the godoc says so.
 		{"claude-code/2.1.285", false},
 		{"curl", false},

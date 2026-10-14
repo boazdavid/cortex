@@ -1284,7 +1284,30 @@ func bobStatus(settingsPath, cortexCfgPath, wantProxy, caPath string, stdout io.
 	// business — and it reads as a complaint about a setting agentop deliberately leaves
 	// alone. An unjudgeable loopback value IS probed: it is the shape agentop writes, and
 	// disable would act on it, so its liveness is informative.
+	//
+	// The VERDICT is bobStateFrom's (configure_status.go), so this paragraph and the row
+	// `agentop configure status` prints cannot disagree about whether Bob is routed —
+	// and it is handed THE DOCUMENT ALREADY READ ABOVE rather than a path. Calling
+	// bobState would have re-read the file, so a settings file edited between the two
+	// reads produced a verdict contradicting the keys printed under it; that is the
+	// same race claudeCodeStateFrom, codexStateFrom and openCodeStateFrom were split
+	// out to avoid (#1164's review caught that bob had been left out of it).
+	//
+	// Only configureOn becomes bobStatusYes, so this command's wording is unchanged by
+	// any of the table's finer distinctions: configurePartial is a drifted loopback
+	// proxy and configureUnknown the unjudgeable-loopback case, both of which it has
+	// always reported as bobStatusNo with the reason in the detail below.
+	//
+	// THE EARLY RETURNS ABOVE ARE THIS COMMAND'S OWN, not a shared wording. Of the
+	// cases the table calls uncertain, only no-document prints bobStatusUnknown here;
+	// a duplicate key and an unreadable file print bobStatusNo, and an unsupported
+	// platform never reaches this function. So the two surfaces agree on the verdict
+	// this line computes, and deliberately differ on how they word the file-level
+	// problems each one reports first.
 	verdict, listening := bobStatusNo, ""
+	if bobStateFrom(settingsPath, doc, cortexCfgPath, wantProxy).State == configureOn {
+		verdict = bobStatusYes
+	}
 	switch existing := doc[bobProxyKey].(type) {
 	case nil:
 		add("%q is unset in %s", bobProxyKey, settingsPath)
@@ -1292,7 +1315,6 @@ func bobStatus(settingsPath, cortexCfgPath, wantProxy, caPath string, stdout io.
 		owns := bobOwns(existing, wantProxy)
 		switch {
 		case owns == bobOurs:
-			verdict = bobStatusYes
 			listening = existing
 			add("%q=%s in %s", bobProxyKey, existing, settingsPath)
 		case owns == bobUnknown:

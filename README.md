@@ -2,11 +2,11 @@
 
 **See what your coding agent actually sends — and pay less for it.**
 
-Works with **Claude Code**, **OpenCode** and **IBM Bob**, and with any agent that can
-use an HTTPS proxy.
+Works with **Claude Code**, **OpenCode**, **Codex** and **IBM Bob**, and with any agent
+that can use an HTTPS proxy.
 
 <img src="./docs/assets/cortex-demo.svg" width="100%"
-     alt="A terminal installs Cortex with one command and points Claude Code at it. Three Claude Code sessions run in separate directories, and agentop then lists all three with their token counts, cost and remaining context. Pressing $ breaks the spend down by tier, where cache reads dominate. Drilling into the busiest session shows the whole conversation and the fifteen-tool manifest it re-sends on every turn.">
+     alt="A terminal installs Cortex with one command, and a second command points Claude Code at it. Three Claude Code sessions run in separate directories, and agentop then lists all three with their token counts, cost and remaining context. Pressing $ breaks the spend down by tier, where cache reads dominate. Drilling into the busiest session shows the whole conversation and the fifteen-tool manifest it re-sends on every turn.">
 
 Cortex sits in your agent's request path on your own machine, decrypts the traffic,
 and shows you every model call, tool call and agent-to-agent message as it happens.
@@ -57,6 +57,7 @@ names the command that fixes it.
 |---|---|---|
 | **Claude Code** | `agentop configure claude-code enable` | [Guide](./docs/agents/claude-code.md) |
 | **OpenCode** | `agentop configure opencode enable` | [Guide](./docs/agents/opencode.md) |
+| **Codex** | `agentop configure codex enable` | [Guide](./docs/agents/codex.md) |
 | **IBM Bob** | `agentop configure bob enable` | [Guide](./cmd/agentop/README.md#routing-the-ibm-bob-editor-through-cortex-agentop-configure-bob) |
 | **Bob Shell** | `agentop configure bobshell enable` | [Guide](./cmd/agentop/README.md#typing-bob-instead-of-agentop-exec----bob-agentop-configure-bobshell) |
 | **Any other agent** | `agentop exec -- <command>` | [Guide](./cmd/agentop/README.md#running-one-command-through-cortex-agentop-exec) |

@@ -574,7 +574,9 @@ func main() {
 	}
 	listeners, lerr := reserveListeners(plan)
 	if lerr != nil {
-		log.Fatalf("%v — is another cortex already running? Nothing on disk was opened", lerr)
+		// Names the process holding the address and exits with exitPortInUse, which the
+		// supervisor tells apart from a crash. See portconflict.go; it does not return.
+		reportListenFailure(lerr)
 	}
 
 	initCtx, initCancel := context.WithTimeout(context.Background(), 60*time.Second)

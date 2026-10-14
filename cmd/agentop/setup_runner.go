@@ -109,8 +109,12 @@ func (e *setupEnv) configPath() string  { return filepath.Join(e.cortexDir, "con
 func (e *setupEnv) previousDir() string { return filepath.Join(e.cortexDir, "previous") }
 
 // tilde shows a path under HOME as ~/…, as every line setup prints does.
-func (e *setupEnv) tilde(p string) string {
-	rel, err := filepath.Rel(e.home, p)
+func (e *setupEnv) tilde(p string) string { return tildePath(e.home, p) }
+
+// tildePath is tilde without a setupEnv, for the commands that have a home and no
+// setup run to take it from — `service status` naming the holder of a port.
+func tildePath(home, p string) string {
+	rel, err := filepath.Rel(home, p)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return p
 	}
