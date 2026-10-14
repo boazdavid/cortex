@@ -226,10 +226,13 @@ func (p *ContextGuru) Configure(raw json.RawMessage) error {
 		p.cfg.Paths = []string{"/v1/chat/completions", "/v1/completions", "/v1/messages", "/v1/responses"}
 	}
 
-	// Engine config: default to the balanced preset when none is supplied.
+	// Engine config: default to the xhigh preset when none is supplied. xhigh includes the
+	// model-calling components (cache_aware_summarizer, extract_llm, extract_llm_sweep); they act
+	// only where a model client resolves (a model: block, or an OpenAI chat-completions request's
+	// own), and every call they make is charged through spend.CostRecorder.
 	engine := p.cfg.Engine
 	if len(engine) == 0 {
-		engine = []byte("preset: balanced")
+		engine = []byte("preset: xhigh")
 	}
 	cfg, err := cgconfig.LoadBytes(engine)
 	if err != nil {
@@ -516,7 +519,7 @@ func (p *ContextGuru) ConfigSchema() []pipeline.FieldSchema {
 	return []pipeline.FieldSchema{
 		{Name: "paths", Type: "[]string", Description: "Inference request paths to compact (default: chat/completions, completions, messages, responses)."},
 		{Name: "model", Type: "object", Description: "Optional static cheap model for LLM-backed components (summarize, extract:code)."},
-		{Name: "engine", Type: "object", Description: "Native context-guru config: preset / pipeline / per-component (marker_mode) / store."},
+		{Name: "engine", Type: "object", Description: "Native context-guru config: preset / pipeline / per-component (marker_mode) / store. Default: preset xhigh."},
 		{Name: "keep_alive", Type: "object", Description: "Opt-in prompt-cache keep-alive: enabled, idle_seconds (270), max_pings (2), max_usd_per_ping (0.50), min_prefix_tokens (80000). Pings bill the caller's own credential; their spend is recorded in the cost ledger where the binary wires a cost recorder, and otherwise only logged."},
 	}
 }

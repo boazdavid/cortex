@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -65,13 +66,20 @@ func inferencePctx(path string, body []byte) *pipeline.Context {
 	}
 }
 
-func TestConfigure_DefaultsBuildBalanced(t *testing.T) {
+func TestConfigure_DefaultsBuildXHigh(t *testing.T) {
 	p := configured(t, `{}`)
 	if p.pipe == nil || p.store == nil {
-		t.Fatal("empty config should default to the balanced preset and build a pipeline + store")
+		t.Fatal("empty config should default to the xhigh preset and build a pipeline + store")
 	}
 	if len(p.cfg.Paths) == 0 {
 		t.Fatal("paths should default to the inference paths")
+	}
+	want := configured(t, `{"engine":{"preset":"xhigh"}}`).pipe.Names()
+	if got := p.pipe.Names(); !slices.Equal(got, want) {
+		t.Errorf("default pipeline = %v, want the xhigh preset's %v", got, want)
+	}
+	if balanced := configured(t, `{"engine":{"preset":"balanced"}}`).pipe.Names(); slices.Equal(p.pipe.Names(), balanced) {
+		t.Errorf("default pipeline is balanced's %v, want xhigh", balanced)
 	}
 }
 

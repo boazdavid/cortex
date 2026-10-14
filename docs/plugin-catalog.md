@@ -70,7 +70,7 @@ enabled.
   - `api_key` — optional bearer token.
   - `max_tokens` — completion cap, default 4096.
   - `timeout_ms` — per-call timeout, default 150000.
-- `engine` (object) — native context-guru config (preset / pipeline / per-component / store), passed through verbatim. Default: `preset: balanced`.
+- `engine` (object) — native context-guru config (preset / pipeline / per-component / store), passed through verbatim. Default: `preset: xhigh`, which includes the model-calling components (`cache_aware_summarizer`, `extract_llm`, `extract_llm_sweep`); they act only where a model client resolves.
 - `keep_alive` (object) — opt-in. Pings an idle session's prompt cache before it expires, so the next turn is a cache hit instead of a full re-send. Off by default; every decision (whether to ping, how much, when to stop) stays inside the context-guru engine, not this plugin.
   - `enabled` (bool) — turn keep-alive on. Default: `false`.
   - `idle_seconds` (int) — idle time before the first ping, measured from the previous request's start. Default: `270`.
