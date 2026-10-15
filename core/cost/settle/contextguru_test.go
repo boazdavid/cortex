@@ -122,3 +122,71 @@ func TestAvoided_ToolPruneDoesNotReadCompactionFacts(t *testing.T) {
 		t.Errorf("PenaltyUSD = %v, want 0: tool-prune cannot cause a prefix rewrite", s.PenaltyUSD)
 	}
 }
+
+// Content removed again on a later turn would have been a cache read by then, so on a turn whose
+// cache hit, the repeated part is priced at the cache-read rate. This is the 5x over-report fix.
+func TestAvoided_ContextGuruPricesARepeatAtTheCacheReadRate(t *testing.T) {
+	s := onlySaving(t, Avoided(cgPctx(0, cgFacts(map[string]any{"savedGross": 4_000, "savedUnique": 0})), rates(t)))
+	if s.TokensAvoided != 4_000 || s.Tier != pricing.TierCacheRead.String() || !near(s.USD, 4_000*3e-6) {
+		t.Errorf("tokens/tier/usd = %d %q %v, want 4000, cache-read, %v", s.TokensAvoided, s.Tier, s.USD, 4_000*3e-6)
+	}
+}
+
+// A mixed turn prices each part at its own rate; the tier names the larger part.
+func TestAvoided_ContextGuruSplitsUniqueAndRepeat(t *testing.T) {
+	s := onlySaving(t, Avoided(cgPctx(0, cgFacts(map[string]any{"savedGross": 4_000, "savedUnique": 1_000})), rates(t)))
+	if want := 1_000*7e-6 + 3_000*3e-6; s.TokensAvoided != 4_000 || !near(s.USD, want) {
+		t.Errorf("tokens/usd = %d %v, want 4000, %v (1000 input + 3000 cache-read)", s.TokensAvoided, s.USD, want)
+	}
+	if s.Tier != pricing.TierCacheRead.String() {
+		t.Errorf("tier = %q, want cache-read, the larger part", s.Tier)
+	}
+	// On a turn that also wrote cache, the unique part is a cache write.
+	s = onlySaving(t, Avoided(cgPctx(2_000, cgFacts(map[string]any{"savedGross": 4_000, "savedUnique": 3_000})), rates(t)))
+	if want := 3_000*11e-6 + 1_000*3e-6; !near(s.USD, want) || s.Tier != pricing.TierCacheWrite.String() {
+		t.Errorf("usd/tier = %v %q, want %v, cache-write", s.USD, s.Tier, want)
+	}
+}
+
+// The fraction comes from the components' sums and applies to the engine's request-level count,
+// which need not equal them.
+func TestAvoided_ContextGuruAppliesTheUniqueFractionToTheEngineCount(t *testing.T) {
+	s := onlySaving(t, Avoided(cgPctx(0, cgFacts(map[string]any{"savedGross": 8_000, "savedUnique": 2_000})), rates(t)))
+	if want := 1_000*7e-6 + 3_000*3e-6; !near(s.USD, want) {
+		t.Errorf("USD = %v, want %v: a quarter of the 4000 engine tokens unique", s.USD, want)
+	}
+}
+
+// On a cache miss the provider re-bills the whole prompt, so the repeated part is not a read: a
+// write when the write covers the prompt, else fresh input (the context-guru proxy's repeatRate).
+func TestAvoided_ContextGuruPricesARepeatOnACacheMiss(t *testing.T) {
+	repeatOnly := cgFacts(map[string]any{"savedGross": 4_000, "savedUnique": 0})
+	for _, tc := range []struct {
+		name         string
+		write, input int
+		tier         pricing.Tier
+		rate         float64
+	}{
+		{"write covers the prompt", 30_000, 500, pricing.TierCacheWrite, 11e-6},
+		{"write smaller than the fresh input", 200, 50_000, pricing.TierInput, 7e-6},
+		{"no cache at all", 0, 50_000, pricing.TierInput, 7e-6},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pctx := cgPctx(tc.write, repeatOnly)
+			pctx.Extensions.Inference.CacheReadTokens = 0
+			pctx.Extensions.Inference.InputTokens = tc.input
+			s := onlySaving(t, Avoided(pctx, rates(t)))
+			if s.Tier != tc.tier.String() || !near(s.USD, 4_000*tc.rate) {
+				t.Errorf("tier/usd = %q %v, want %q, %v", s.Tier, s.USD, tc.tier, 4_000*tc.rate)
+			}
+		})
+	}
+}
+
+// A unique count above the gross is clamped, so the repeated part never goes negative.
+func TestAvoided_ContextGuruClampsTheUniqueFraction(t *testing.T) {
+	s := onlySaving(t, Avoided(cgPctx(0, cgFacts(map[string]any{"savedGross": 4_000, "savedUnique": 9_000})), rates(t)))
+	if s.Tier != pricing.TierInput.String() || !near(s.USD, 4_000*7e-6) {
+		t.Errorf("tier/usd = %q %v, want input, %v", s.Tier, s.USD, 4_000*7e-6)
+	}
+}

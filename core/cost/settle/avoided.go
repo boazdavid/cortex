@@ -1,6 +1,8 @@
 package settle
 
 import (
+	"math"
+
 	"github.com/rossoctl/cortex/core/cost/event"
 	"github.com/rossoctl/cortex/core/cost/pricing"
 	"github.com/rossoctl/cortex/core/pipeline"
@@ -194,6 +196,10 @@ type compactionFacts struct {
 	TokensAfter  int
 	// PrefixRewritten says a change landed inside the prefix the provider had cached.
 	PrefixRewritten bool
+	// UniqueFrac is the part of the saving removed for the first time in this session
+	// (SavedUnique/SavedGross), in [0, 1]. The rest is content removed again on a later turn.
+	// 1 when the event does not split its saving.
+	UniqueFrac float64
 }
 
 // compactionFactsFrom decodes context-guru's event. Refused, like factsFrom, without a positive
@@ -210,9 +216,13 @@ func compactionFactsFrom(v any) (compactionFacts, bool) {
 		TokensBefore:    intField(m, "tokensBefore"),
 		TokensAfter:     intField(m, "tokensAfter"),
 		PrefixRewritten: boolField(m, "prefixRewritten"),
+		UniqueFrac:      1,
 	}
 	if f.BytesRemoved <= 0 || f.BodyBytesAfter <= 0 {
 		return compactionFacts{}, false
+	}
+	if gross := intField(m, "savedGross"); gross > 0 {
+		f.UniqueFrac = min(1, max(0, float64(intField(m, "savedUnique"))/float64(gross)))
 	}
 	return f, true
 }
@@ -220,7 +230,8 @@ func compactionFactsFrom(v any) (compactionFacts, bool) {
 // compactionDraft is context-guru's rule. Tokens are the engine's own count of what it removed,
 // preferred to the byte ratio because compaction rewrites message text, whose token density need
 // not match the rest of the body — still an estimate, since the engine's tokenizer is not the
-// provider's. The tier is compactionUsage's counterfactual, and a prefix rewrite carries a penalty.
+// provider's. The tokens split by UniqueFrac: the unique part is priced at compactionUsage's tier,
+// the repeated part at repeatUsage's. A prefix rewrite carries a penalty.
 func compactionDraft(v any, c calibration) (draft, bool) {
 	f, ok := compactionFactsFrom(v)
 	if !ok {
@@ -230,20 +241,57 @@ func compactionDraft(v any, c calibration) (draft, bool) {
 	if f.TokensBefore > f.TokensAfter && f.TokensAfter > 0 {
 		tokens = f.TokensBefore - f.TokensAfter
 	}
-	saved, tier := compactionUsage(c.usage, tokens)
+	unique := int(math.Round(float64(tokens) * f.UniqueFrac))
+	saved, tier := compactionUsage(c.usage, unique)
+	if repeat := tokens - unique; repeat > 0 {
+		r, rTier := repeatUsage(c.usage, repeat)
+		saved = addUsage(saved, r)
+		// One tier per saving on the wire: name the larger part. USD prices both.
+		if repeat > unique {
+			tier = rTier
+		}
+	}
 	return draft{tokens: tokens, saved: saved, tier: tier, projected: f.Projected,
 		prefixRewritten: f.PrefixRewritten}, true
 }
 
-// compactionUsage is the tier compaction's removed tokens would have been billed at. The engine
-// compacts the uncached tail, so without compaction those tokens were fresh input — or a cache
-// write, on a turn whose response shows the tail being written. Never cache-read: the tier the
-// compacted prompt landed in (pricing.AvoidedUsage's rule) is not the counterfactual here.
+// compactionUsage is the tier the UNIQUE part of a compaction would have been billed at: content
+// removed for the first time. The engine compacts the uncached tail, so without compaction those
+// tokens were fresh input — or a cache write, on a turn whose response shows the tail being
+// written. Never cache-read: the tier the compacted prompt landed in (pricing.AvoidedUsage's rule)
+// is not the counterfactual here.
 func compactionUsage(u pricing.Usage, tokens int) (pricing.Usage, pricing.Tier) {
 	if u.CacheWrite > 0 {
 		return pricing.Usage{CacheWrite: tokens}, pricing.TierCacheWrite
 	}
 	return pricing.Usage{Input: tokens}, pricing.TierInput
+}
+
+// repeatUsage is the tier the REPEATED part would have been billed at: content removed on an
+// earlier turn and removed again now. Without compaction it would sit in the cached prefix by now,
+// so it is a cache read — when this request's cache hit. On a miss the provider re-bills the whole
+// prompt: at the cache-write rate when the write covers the prompt (writes at least the fresh
+// input), else as fresh input. This is the context-guru proxy's dash.Event.repeatRate, so the two
+// report the same saving for the same request.
+//
+// Pricing repeats as unique was the over-report this replaces: on a long session nearly all of a
+// turn's saving is repeated content, and pricing it at 1x or 1.25x instead of 0.1x reported about
+// five times the measured saving.
+func repeatUsage(u pricing.Usage, tokens int) (pricing.Usage, pricing.Tier) {
+	switch {
+	case u.CacheRead > 0:
+		return pricing.Usage{CacheRead: tokens}, pricing.TierCacheRead
+	case u.CacheWrite > 0 && u.CacheWrite >= u.Input:
+		return pricing.Usage{CacheWrite: tokens}, pricing.TierCacheWrite
+	default:
+		return pricing.Usage{Input: tokens}, pricing.TierInput
+	}
+}
+
+// addUsage sums two prompt-tier usages. Only the prompt tiers: a saving has no output.
+func addUsage(a, b pricing.Usage) pricing.Usage {
+	return pricing.Usage{Input: a.Input + b.Input, CacheWrite: a.CacheWrite + b.CacheWrite,
+		CacheRead: a.CacheRead + b.CacheRead}
 }
 
 // rewritePenalty prices a rewrite inside the cached prefix: the response's cache-write tokens at

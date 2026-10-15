@@ -74,6 +74,11 @@ type savingEvent struct {
 	FrozenTokens    int `json:"frozenTokens"`    // Trace.FrozenTokens: the cached prefix left alone
 	PrefixRewritten bool `json:"prefixRewritten"` // a change landed at or below Trace.MaxCachedIdx
 
+	// The components' savings split into all of it and the part this session has not had
+	// removed before (§1.4 rule 2). Always sent, so 0 unique reads as "all repeat".
+	SavedGross  int `json:"savedGross"`
+	SavedUnique int `json:"savedUnique"`
+
 	// Per component, engine token counts, no content.
 	Components []componentSaving `json:"components,omitempty"`
 }
@@ -82,8 +87,15 @@ type componentSaving struct {
 	Component string `json:"component"`
 	Saved     int    `json:"saved"`             // Report.Saved()
 	Replay    bool   `json:"replay,omitempty"`  // Report.Replays > 0: a free replay, not a fresh act
+	Unique    int    `json:"unique"`            // part of Saved new to this session (see below)
 }
 ```
+
+`Unique` uses the engine's `dash.Recorder.MarkUnique` rule, so Cortex and the context-guru proxy
+agree: the plugin keeps a set of seen `Report.CacheKeys` per session (and component), the unique
+part is `saved × newKeys / len(keys)`, and a component with no keys counts as unique. Scoped by
+session rather than by tenant, because a provider cache is per conversation. The set is bounded
+(200,000 hashed entries, cleared when full, as `MarkUnique` is).
 
 No message text: the session API is unauthenticated, and `Trace.Changes` carries clipped
 before/after text, so it is never published.
@@ -99,9 +111,20 @@ test (the list stays explicit):
 1. Tokens: `TokensBefore − TokensAfter` from the engine. Fall back to the byte ratio only when
    the engine counts are absent. Mark `Estimated` either way: the engine's counts are its own
    tokenizer's, not the provider's.
-2. Tier: the removed tokens came from the uncached tail (the engine compacts only above the
-   frozen prefix when cache-aware), so price them at the input rate, or at the cache-write rate
-   when the response shows a cache write on this turn (the tail would have been written).
+2. Tier: split the tokens by `SavedUnique / SavedGross` (1 when the event does not split).
+   - The **unique** part is content removed for the first time. It came from the uncached tail
+     (the engine compacts only above the frozen prefix when cache-aware), so price it at the input
+     rate, or at the cache-write rate when the response shows a cache write on this turn.
+   - The **repeated** part is content removed on an earlier turn and removed again. Without
+     compaction it would sit in the cached prefix by now, so price it at the cache-read rate when
+     this request's cache hit; on a miss, at the cache-write rate when the write covers the prompt
+     (cache write ≥ fresh input), else at the input rate. This is the proxy's `Event.repeatRate`.
+   - `Saving.Tier` names the larger part; `USD` prices both.
+
+   **Correction (2026-10-15).** The first version of this rule priced every removed token as
+   unique, on every turn. On a long session most of a turn's saving is repeated content, so the
+   rule reported about 5× the measured saving (fill-end comparison: $1.358 reported against
+   $0.271 measured, arm A). `componentSaving.Replay` was published but no rule read it.
 3. Penalty: when `PrefixRewritten`, subtract the extra cache-write the rewrite caused —
    the response's `cache_write` tokens times `(cache-write − cache-read)` rate. This is the
    only way the saving goes negative, and it uses the response's own counts.

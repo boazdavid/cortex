@@ -290,7 +290,9 @@ type Saving struct {
 	Provenance string `json:"provenance,omitempty"`
 	// Tier names which prompt tier the saving came out of: cache-write, cache-read or
 	// input. It matters because they differ by 12.5x, and a saving quoted without it
-	// cannot be checked.
+	// cannot be checked. A context-guru saving can span two tiers (content removed for the
+	// first time, and content removed again); Tier then names the larger part, and USD
+	// prices both.
 	Tier string `json:"tier,omitempty"`
 	// Projected marks a saving that was measured but NOT APPLIED — tool-prune's
 	// observe mode leaves every byte on the wire. A consumer must present this as

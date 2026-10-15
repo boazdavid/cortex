@@ -202,6 +202,9 @@ type ContextGuru struct {
 	// (apply.Trace.Session), so OnFinish records billed input under the key OnRequest reads.
 	// One entry per session, overwritten on each request.
 	cgSessions sync.Map
+	// seen splits each saving into content removed for the first time and content removed again,
+	// per session; see unique.go.
+	seen *seenKeys
 
 	// Keep-alive, all nil/zero unless keep_alive.enabled. The keeper decides when to ping; disp
 	// only sends and holds the credential.
@@ -279,6 +282,7 @@ func (p *ContextGuru) Configure(raw json.RawMessage) error {
 	d := newCortexDispatcher(newPingClient())
 	d.rates = func() pricing.Resolver { return p.rates }
 	p.holds, p.stash = newCredHolds(d), newSentStash()
+	p.seen = newSeenKeys()
 
 	// A keeper built here stays unstarted until Init runs. The normal lifecycle is Configure, then
 	// Init, on a fresh instance; a Configure after Init does not happen there, and a keeper it
@@ -414,7 +418,7 @@ func (p *ContextGuru) OnRequest(ctx context.Context, pctx *pipeline.Context) pip
 		if !applied {
 			msg = "context-guru would rewrite request body (on_error: observe, not applied)"
 		}
-		publishSaving(pctx, savingEventFrom(before, len(out), applied, res.Trace))
+		publishSaving(pctx, savingEventFrom(before, len(out), applied, res.Trace, p.seen.forSession(sid)))
 		slog.Info(msg,
 			"provider", provider, "path", pctx.Path, "session", sid,
 			"bytesBefore", before, "bytesAfter", len(out), "pctSaved", pct(before, len(out)))

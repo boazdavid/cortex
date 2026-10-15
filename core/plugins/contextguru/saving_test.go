@@ -116,7 +116,7 @@ func TestSavingEventPrefixRewritten(t *testing.T) {
 		{"not cache-aware", apply.Trace{CacheAware: false, MaxCachedIdx: 3, Run: run(acted(0))}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			ev := savingEventFrom(1000, 600, true, tc.tr)
+			ev := savingEventFrom(1000, 600, true, tc.tr, nil)
 			if ev.PrefixRewritten != tc.want {
 				t.Errorf("PrefixRewritten = %v, want %v", ev.PrefixRewritten, tc.want)
 			}
@@ -130,7 +130,7 @@ func TestSavingEventMarksReplays(t *testing.T) {
 		{Component: "extract_llm", TokensBefore: 50, TokensAfter: 10, Replays: 2},
 		{Component: "mask", Skipped: true},
 	}}}
-	ev := savingEventFrom(1000, 600, true, tr)
+	ev := savingEventFrom(1000, 600, true, tr, nil)
 	if len(ev.Components) != 1 || ev.Components[0].Component != "extract_llm" || !ev.Components[0].Replay ||
 		ev.Components[0].Saved != 40 {
 		t.Fatalf("components = %+v, want one replayed extract_llm saving 40", ev.Components)

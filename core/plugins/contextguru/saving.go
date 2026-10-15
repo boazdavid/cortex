@@ -28,8 +28,16 @@ type savingEvent struct {
 	// previous turn, so the provider re-writes that prefix: settle charges that as a penalty.
 	// False when the engine did not know the boundary (not cache-aware, or the first turn): the
 	// penalty is then unknown, not zero, and settle cannot charge it.
-	PrefixRewritten bool              `json:"prefixRewritten,omitempty"`
-	Components      []componentSaving `json:"components,omitempty"`
+	PrefixRewritten bool `json:"prefixRewritten,omitempty"`
+	// SavedGross and SavedUnique split the components' savings, in engine tokens, into all of it
+	// and the part this session has not had removed before. Content removed on an earlier turn
+	// sits in the provider's cached prefix by now, so without compaction it would have been a
+	// cache read, not fresh input: settle prices the two parts at different rates, with the
+	// fraction SavedUnique/SavedGross. Both are always sent, so settle can tell "all repeat"
+	// (SavedUnique 0) from a producer that does not split.
+	SavedGross  int               `json:"savedGross"`
+	SavedUnique int               `json:"savedUnique"`
+	Components  []componentSaving `json:"components,omitempty"`
 }
 
 // componentSaving is one engine component's contribution, in engine tokens.
@@ -39,11 +47,18 @@ type componentSaving struct {
 	// Replay marks a saving made by replaying a decision taken on an earlier turn: no model
 	// call and no new spend, so it must not be read as a fresh act.
 	Replay bool `json:"replay,omitempty"`
+	// Unique is the part of Saved this session has not had removed before (seenKeys.markUnique).
+	Unique int `json:"unique"`
 }
 
+// uniqueFunc returns the part of a component's saving that is new to the session, given the
+// component's content keys (seenKeys.markUnique, bound to one session).
+type uniqueFunc func(component string, keys []string, saved int) int
+
 // savingEventFrom builds the event from the body sizes and the engine's trace. applied is this
-// plugin's own SetBody result.
-func savingEventFrom(before, after int, applied bool, tr apply.Trace) savingEvent {
+// plugin's own SetBody result. unique splits each saving into new and repeated content; nil
+// counts every saving as new.
+func savingEventFrom(before, after int, applied bool, tr apply.Trace, unique uniqueFunc) savingEvent {
 	ev := savingEvent{
 		BytesRemoved:   before - after,
 		BodyBytesAfter: after,
@@ -68,7 +83,14 @@ func savingEventFrom(before, after int, applied bool, tr apply.Trace) savingEven
 			}
 		}
 		if s := r.Saved(); s > 0 {
-			ev.Components = append(ev.Components, componentSaving{Component: r.Component, Saved: s, Replay: r.Replays > 0})
+			u := s
+			if unique != nil {
+				u = unique(r.Component, r.CacheKeys, s)
+			}
+			ev.SavedGross += s
+			ev.SavedUnique += u
+			ev.Components = append(ev.Components, componentSaving{Component: r.Component, Saved: s,
+				Replay: r.Replays > 0, Unique: u})
 		}
 	}
 	return ev
