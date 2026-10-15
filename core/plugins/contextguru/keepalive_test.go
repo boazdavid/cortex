@@ -2,12 +2,17 @@ package contextguru
 
 import (
 	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	bschemas "github.com/maximhq/bifrost/core/schemas"
 	cgconfig "github.com/rossoctl/context-guru/config"
 	"github.com/rossoctl/context-guru/dispatch"
+	"github.com/rossoctl/context-guru/keepalive"
 	"github.com/rossoctl/cortex/core/pipeline"
 )
 
@@ -283,5 +288,146 @@ func TestRequestFinishingAfterShutdownHoldsNothing(t *testing.T) {
 	}
 	if n := p.keeper.Stats().Live; n != 0 {
 		t.Fatalf("live entries after a post-Shutdown finish = %d, want 0", n)
+	}
+}
+
+// credID is an opaque per-process id for the caller's credential (Record.Cred): distinct keys get
+// distinct, non-empty ids; the same key the same id; no auth header "". It never carries the key.
+func TestCredIDIsPerCredential(t *testing.T) {
+	a1 := credID(http.Header{"Authorization": {"Bearer sk-caller-a"}})
+	a2 := credID(http.Header{"Authorization": {"Bearer sk-caller-a"}, "Anthropic-Version": {"2023-06-01"}})
+	b := credID(http.Header{"Authorization": {"Bearer sk-caller-b"}})
+	x := credID(http.Header{"X-Api-Key": {"sk-caller-a"}})
+	if a1 == "" || b == "" || x == "" {
+		t.Fatalf("an auth header gave an empty id: a=%q b=%q x=%q", a1, b, x)
+	}
+	if a1 != a2 {
+		t.Errorf("the same key gave two ids (%q, %q): a non-auth header must not count", a1, a2)
+	}
+	if a1 == b || a1 == x {
+		t.Errorf("different credentials share an id: a=%q b=%q x-api-key=%q", a1, b, x)
+	}
+	if strings.Contains(a1, "sk-caller") || len(a1) != 32 {
+		t.Errorf("id %q is not a 16-byte hex digest", a1)
+	}
+	if got := credID(http.Header{"Anthropic-Version": {"2023-06-01"}}); got != "" {
+		t.Errorf("no auth header gave %q, want \"\"", got)
+	}
+	if got := credID(nil); got != "" {
+		t.Errorf("nil headers gave %q, want \"\"", got)
+	}
+	r, _ := recordFor(finishedPctx(200, pipeline.AgentRoleMain), "s1", keepAliveConfig{Enabled: true}.policy(),
+		func() dispatch.Ref { return "" }, logEmitter{})
+	if r.Cred != credID(http.Header{"Authorization": {"Bearer caller"}}) {
+		t.Errorf("recordFor set Cred %q, want the caller's credential id", r.Cred)
+	}
+}
+
+// One caller's revoked key must not stop keep-alive for another caller of the same host, path and
+// model. Cortex pings with the caller's own credential, so a 401 is that credential's fault: with
+// Cred "" the keeper fed it to the route breaker, whose key every caller shares, and three of
+// them switched the route off for everyone for an hour.
+func TestOneCallersRefusedKeyDoesNotStopAnotherCallersPings(t *testing.T) {
+	var mu sync.Mutex
+	pingsB := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "Bearer sk-revoked-a" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		mu.Lock()
+		pingsB++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"usage":{"input_tokens":1,"cache_read_input_tokens":48000,"output_tokens":1}}`))
+	}))
+	defer srv.Close()
+	d := newCortexDispatcher(newPingClient())
+	now := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
+	k := keepalive.New(keepalive.Options{Dispatcher: d, Now: func() time.Time { return now },
+		Go: func(f func()) { f() }})
+	t.Cleanup(k.Shutdown)
+	pol := keepalive.Policy{KeepAlive: true, Idle: 280 * time.Second, MaxPings: 2,
+		MaxUSDPerPing: 0.25, MinPrefixTokens: 20000}
+	host := stripScheme(srv.URL)
+	// hold records two turns of one session (a session's first request is never held), through
+	// recordFor, so Cred is computed exactly as OnFinish computes it.
+	hold := func(sid, auth string) {
+		for i := 0; i < 2; i++ {
+			pctx := finishedPctx(200, pipeline.AgentRoleMain)
+			pctx.Scheme, pctx.Host = "http", host
+			pctx.StartedAt = now
+			pctx.Headers = http.Header{"Authorization": {auth}}
+			hdr := pctx.Headers
+			r, ok := recordFor(pctx, sid, pol, func() dispatch.Ref { return d.hold("http", host, hdr) }, logEmitter{})
+			if !ok {
+				t.Fatal("setup: recordFor refused a main-thread request")
+			}
+			k.Record(r)
+		}
+	}
+	for i := 0; i < 3; i++ { // three refusals on caller A's key, each its own session
+		hold("a"+strconv.Itoa(i), "Bearer sk-revoked-a")
+		now = now.Add(281 * time.Second)
+		k.Sweep(now)
+	}
+	if s := k.Stats(); s.RouteTrips != 0 {
+		t.Fatalf("caller A's refused key tripped the shared route (%d trips)", s.RouteTrips)
+	}
+	hold("b", "Bearer sk-caller-b")
+	if _, ok := k.Entry(keepalive.Key{Session: "b"}); !ok {
+		t.Fatal("caller B's session was refused after caller A's key was revoked")
+	}
+	now = now.Add(281 * time.Second)
+	k.Sweep(now)
+	mu.Lock()
+	defer mu.Unlock()
+	if pingsB != 1 {
+		t.Errorf("caller B got %d pings, want 1", pingsB)
+	}
+}
+
+// A panic in OnFinish before Record (here recordBilled, on a corrupt session-key entry) is
+// recovered by the pipeline's dispatchFinish; the request's arrival must still be departed, or the
+// thread reads as in flight until a restart and is never pinged again.
+func TestAPanicInOnFinishStillDeparts(t *testing.T) {
+	p := keepAlivePlugin(t)
+	finishTurns(t, p, 1) // turn 0: counted, never held
+	a := finishedPctx(200, pipeline.AgentRoleMain)
+	invokeReq(p, a)      // request A arrives
+	finishTurns(t, p, 1) // request B, overlapping, finishes and holds
+	if n := p.keeper.Stats().Live; n != 1 {
+		t.Fatalf("setup: %d live entries, want 1", n)
+	}
+	p.cgSessions.Store(sessionID(a), 42) // recordBilled's key.(string) panics on this
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("setup: OnFinish did not panic")
+			}
+		}()
+		p.OnFinish(t.Context(), a)
+	}()
+	if n := p.keeper.Sweep(time.Unix(1_700_000_000, 0).Add(281 * time.Second)); n != 1 {
+		t.Fatalf("sweep sent %d pings, want 1 — A's arrival leaked when its OnFinish panicked", n)
+	}
+}
+
+// OnFinish departs exactly once on the path that reaches Record (Record departs for itself): a
+// second Depart would release an OVERLAPPING request's count and let its thread be pinged while
+// that request is still open.
+func TestARecordedFinishDoesNotReleaseAnOverlappingRequest(t *testing.T) {
+	p := keepAlivePlugin(t)
+	finishTurns(t, p, 1) // turn 0: counted, never held
+	a := finishedPctx(200, pipeline.AgentRoleMain)
+	b := finishedPctx(200, pipeline.AgentRoleMain)
+	invokeReq(p, a)
+	invokeReq(p, b)
+	p.OnFinish(t.Context(), a) // A finishes and holds; B is still open
+	if n := p.keeper.Stats().Live; n != 1 {
+		t.Fatalf("setup: %d live entries, want 1", n)
+	}
+	if n := p.keeper.Sweep(time.Unix(1_700_000_000, 0).Add(281 * time.Second)); n != 0 {
+		t.Fatalf("sweep sent %d pings while B was still open, want 0 — A departed twice", n)
 	}
 }

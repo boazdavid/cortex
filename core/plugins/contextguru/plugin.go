@@ -457,9 +457,10 @@ func (p *ContextGuru) Shutdown(context.Context) error {
 // kaArrived marks, on pctx, that THIS request's OnRequest opened a keep-alive arrival — set only
 // when the Arrive gate there passed (see OnRequest). Record itself departs on every path, via its
 // own deferred Keeper.Depart; what it does not cover is a path that never reaches Record at all.
-// OnFinish checks this marker before every such return and, when set, calls Depart with the same
-// key Arrive used — otherwise that arrival stays open on its thread's key forever (until Forget or
-// a restart), which the keeper's sweep reads as a request still in flight and never pings again.
+// OnFinish checks this marker in a deferred call and, when set and Record was not reached, calls
+// Depart with the same key Arrive used — otherwise that arrival stays open on its thread's key
+// forever (until Forget or a restart), which the keeper's sweep reads as a request still in
+// flight and never pings again.
 type kaArrived struct{}
 
 // kaArrivedStateKey is this plugin's own key into pctx.Extensions.Custom (see pipeline.SetState) —
@@ -473,20 +474,28 @@ const kaArrivedStateKey = "context-guru-keepalive-arrived"
 func (p *ContextGuru) OnFinish(_ context.Context, pctx *pipeline.Context) {
 	sid := sessionID(pctx)
 	arrived := pipeline.GetState[kaArrived](pctx, kaArrivedStateKey) != nil
-	depart := func() {
-		if arrived {
+	// Depart this request's arrival on every path that does not reach Record — the early returns
+	// below, and a panic in recordBilled, stashSent or recordFor, which the pipeline's
+	// dispatchFinish recovers (without this the arrival would stay open until a restart). Not
+	// unconditional: Record departs for itself, and a second Depart would release a CONCURRENT
+	// request's count on the same thread. `recorded` is set immediately before Record.
+	//
+	// That covers a request that finishes after Shutdown (one still draining on the old pipeline
+	// after a hot-reload), which must hold nothing: no sweep would ever ping it, and Shutdown's
+	// sweep over the live entries does not touch the inflight count. It also covers what
+	// recordFor skips — a subagent request and one with no inference parse (and one with no
+	// session, which cannot be true when arrived: that requires sid != "", and it cannot change
+	// between OnRequest and OnFinish).
+	recorded := false
+	defer func() {
+		if arrived && !recorded {
 			p.keeper.Depart(keepalive.Key{Session: sid})
 		}
-	}
-	// A request that finishes after Shutdown (one still draining on the old pipeline after a
-	// hot-reload) must hold nothing: no sweep would ever ping it. Its own arrival (if any) still
-	// needs departing — Shutdown's sweep over the live entries does not touch the inflight count.
+	}()
 	if p.stopped.Load() {
-		depart()
 		return
 	}
 	if (pctx.Headers != nil && pctx.Headers.Get(sentinelHeader) != "") || !p.gated(pctx.Path) {
-		depart()
 		return
 	}
 	if sid != "" {
@@ -502,13 +511,9 @@ func (p *ContextGuru) OnFinish(_ context.Context, pctx *pipeline.Context) {
 	r, ok := recordFor(pctx, sid, p.kaPol, func() dispatch.Ref { return disp.hold(scheme, host, hdr) },
 		p.pingEmitter(pctx, sid))
 	if !ok {
-		// recordFor skips a subagent request and one with no inference parse (and one with no
-		// session, which cannot be true here: arrived requires sid != "" and that cannot change
-		// between OnRequest and OnFinish). Record's own deferred Depart never runs for these —
-		// Record itself is never called — so this call is the only thing that closes them.
-		depart()
 		return
 	}
+	recorded = true
 	p.keeper.Record(r)
 }
 

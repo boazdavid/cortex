@@ -59,8 +59,11 @@ func recordFor(pctx *pipeline.Context, sid string, pol keepalive.Policy, hold fu
 		return keepalive.Record{}, false
 	}
 	provider, _ := dialectFor(pctx.Path)
+	// Cred is the caller's own credential as an opaque per-process id (credID), so a refusal marks
+	// that credential dead instead of tripping the route for every caller of the endpoint.
 	return keepalive.Record{
 		Key:       keepalive.Key{Session: sid},
+		Cred:      credID(pctx.Headers),
 		StartedAt: pctx.StartedAt,
 		Body:      pctx.Body,
 		Provider:  provider,
