@@ -202,6 +202,67 @@ func TestConfigSchemaListsKeepAlive(t *testing.T) {
 	t.Fatal("ConfigSchema has no keep_alive entry")
 }
 
+// TestASkippedSubagentRequestDoesNotPauseTheMainThread covers a request that looks like ordinary
+// traffic when OnRequest runs — Extensions.Inference is still nil, as it would be if this plugin
+// runs before inference-parser's own OnRequest in the chain — so isSubagent is false there and
+// Arrive opens an arrival on the session's (threadless) key. By OnFinish, inference-parser has
+// since run and the request turns out to be a subagent's, which recordFor skips: no Record, and
+// before this fix, no Depart either. That leaked arrival pins the main thread's OWN entry
+// in-flight (same Key{Session: sid}, no Thread — #423's per-thread keying collapses to one key
+// when nothing ever sets Thread), so the keeper's sweep would never ping it again.
+func TestASkippedSubagentRequestDoesNotPauseTheMainThread(t *testing.T) {
+	p := keepAlivePlugin(t)
+
+	sub := inferencePctx("/v1/messages", []byte(`{"model":"claude-sonnet-5","messages":[]}`))
+	sub.StartedAt = time.Unix(1_700_000_000, 0)
+	sub.StatusCode = 200
+	sub.Headers = http.Header{"Authorization": {"Bearer caller"}, "Anthropic-Version": {"2023-06-01"}}
+	invokeReq(p, sub) // Extensions.Inference is nil: isSubagent is false, so Arrive fires here.
+	sub.Extensions.Inference = &pipeline.InferenceExtension{Model: "claude-sonnet-5",
+		InputTokens: 3, CacheReadTokens: 48_000, OutputTokens: 120,
+		PresentKinds: 1 | 2 | 4 | 8, AgentRole: pipeline.AgentRoleSubagent}
+	p.OnFinish(t.Context(), sub) // recordFor now sees the subagent role and skips.
+
+	// The main thread's own ordinary turns, after the subagent request. Turn 0 is counted but
+	// never tracked (the engine's first-request gate); turn 1 establishes the live entry.
+	finishTurns(t, p, 2)
+	if n := p.keeper.Stats().Live; n != 1 {
+		t.Fatalf("live entries after the main thread's turns = %d, want 1", n)
+	}
+
+	if n := p.keeper.Sweep(time.Unix(1_700_000_000, 0).Add(281 * time.Second)); n != 1 {
+		t.Fatalf("sweep sent %d pings, want 1 — the skipped subagent request's undeparted "+
+			"arrival pinned the main thread's entry in-flight", n)
+	}
+}
+
+// TestARequestWithNoInferenceParseDoesNotPauseTheMainThread is
+// TestASkippedSubagentRequestDoesNotPauseTheMainThread's sibling for recordFor's other skip:
+// Extensions.Inference stays nil all the way to OnFinish (no parser ever populated it, e.g. a
+// gated path that isn't valid inference traffic). Arrive still opens on it in OnRequest, and
+// without a Depart on this path too the leaked arrival would pin the main thread's entry the
+// same way.
+func TestARequestWithNoInferenceParseDoesNotPauseTheMainThread(t *testing.T) {
+	p := keepAlivePlugin(t)
+
+	noParse := inferencePctx("/v1/messages", []byte(`{"model":"claude-sonnet-5","messages":[]}`))
+	noParse.StartedAt = time.Unix(1_700_000_000, 0)
+	noParse.StatusCode = 200
+	noParse.Headers = http.Header{"Authorization": {"Bearer caller"}, "Anthropic-Version": {"2023-06-01"}}
+	invokeReq(p, noParse)            // Arrive fires: no Extensions.Inference, so isSubagent is false.
+	p.OnFinish(t.Context(), noParse) // recordFor skips: still no Extensions.Inference.
+
+	finishTurns(t, p, 2)
+	if n := p.keeper.Stats().Live; n != 1 {
+		t.Fatalf("live entries after the main thread's turns = %d, want 1", n)
+	}
+
+	if n := p.keeper.Sweep(time.Unix(1_700_000_000, 0).Add(281 * time.Second)); n != 1 {
+		t.Fatalf("sweep sent %d pings, want 1 — the no-inference-parse request's undeparted "+
+			"arrival pinned the main thread's entry in-flight", n)
+	}
+}
+
 func TestRequestFinishingAfterShutdownHoldsNothing(t *testing.T) {
 	p := configured(t, `{"keep_alive": {"enabled": true, "min_prefix_tokens": 1}}`)
 	if err := p.Init(t.Context()); err != nil {

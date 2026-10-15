@@ -361,8 +361,16 @@ func (p *ContextGuru) OnRequest(ctx context.Context, pctx *pipeline.Context) pip
 	// credential it held) before this request goes upstream, so no ping races it. A subagent's
 	// request says nothing about whether the main thread is idle, and the main thread is the only
 	// one recorded, so it leaves the main thread's entry alone.
+	//
+	// isSubagent is checked with whatever Extensions.Inference holds right now — nil when, as
+	// here, this plugin runs before inference-parser's own OnRequest. A request that only turns
+	// out to be a subagent's once inference-parser has run still opens an arrival here, and
+	// OnFinish's own isSubagent check (via recordFor) can then disagree with this one. The
+	// kaArrived marker records what THIS call decided, so OnFinish departs exactly the arrivals
+	// this call made — never fewer, never (on a session a concurrent request shares) one too many.
 	if p.keeper != nil && !p.stopped.Load() && sid != "" && !isSubagent(pctx) {
 		p.keeper.Arrive(keepalive.Key{Session: sid})
+		pipeline.SetState(pctx, kaArrivedStateKey, &kaArrived{})
 	}
 	if p.pipe == nil || len(pctx.Body) == 0 {
 		return cont
@@ -446,20 +454,41 @@ func (p *ContextGuru) Shutdown(context.Context) error {
 	return nil
 }
 
+// kaArrived marks, on pctx, that THIS request's OnRequest opened a keep-alive arrival — set only
+// when the Arrive gate there passed (see OnRequest). Record itself departs on every path, via its
+// own deferred Keeper.Depart; what it does not cover is a path that never reaches Record at all.
+// OnFinish checks this marker before every such return and, when set, calls Depart with the same
+// key Arrive used — otherwise that arrival stays open on its thread's key forever (until Forget or
+// a restart), which the keeper's sweep reads as a request still in flight and never pings again.
+type kaArrived struct{}
+
+// kaArrivedStateKey is this plugin's own key into pctx.Extensions.Custom (see pipeline.SetState) —
+// per-request, so it cannot be confused with another request sharing the same session.
+const kaArrivedStateKey = "context-guru-keepalive-arrived"
+
 // OnFinish hands the finished request to the keeper. Here and not in OnResponse: inference-parser
 // settles token counts after this plugin's response hook, and by OnFinish they are final and
 // pctx.Body still holds the compacted bytes that went upstream (spec §8). A mapping and one
 // Record call — no I/O — so it stays far inside the finish timeout and cannot change the outcome.
 func (p *ContextGuru) OnFinish(_ context.Context, pctx *pipeline.Context) {
+	sid := sessionID(pctx)
+	arrived := pipeline.GetState[kaArrived](pctx, kaArrivedStateKey) != nil
+	depart := func() {
+		if arrived {
+			p.keeper.Depart(keepalive.Key{Session: sid})
+		}
+	}
 	// A request that finishes after Shutdown (one still draining on the old pipeline after a
-	// hot-reload) must hold nothing: no sweep would ever ping it.
+	// hot-reload) must hold nothing: no sweep would ever ping it. Its own arrival (if any) still
+	// needs departing — Shutdown's sweep over the live entries does not touch the inflight count.
 	if p.stopped.Load() {
+		depart()
 		return
 	}
 	if (pctx.Headers != nil && pctx.Headers.Get(sentinelHeader) != "") || !p.gated(pctx.Path) {
+		depart()
 		return
 	}
-	sid := sessionID(pctx)
 	if sid != "" {
 		p.recordBilled(pctx, sid)
 		p.stashSent(pctx, sid)
@@ -473,6 +502,11 @@ func (p *ContextGuru) OnFinish(_ context.Context, pctx *pipeline.Context) {
 	r, ok := recordFor(pctx, sid, p.kaPol, func() dispatch.Ref { return disp.hold(scheme, host, hdr) },
 		p.pingEmitter(pctx, sid))
 	if !ok {
+		// recordFor skips a subagent request and one with no inference parse (and one with no
+		// session, which cannot be true here: arrived requires sid != "" and that cannot change
+		// between OnRequest and OnFinish). Record's own deferred Depart never runs for these —
+		// Record itself is never called — so this call is the only thing that closes them.
+		depart()
 		return
 	}
 	p.keeper.Record(r)
