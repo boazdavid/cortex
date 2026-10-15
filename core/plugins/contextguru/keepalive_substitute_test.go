@@ -80,7 +80,11 @@ func TestCortexSubstitutesCacheAwareSummarizerForAPing(t *testing.T) {
 
 	pol := keepalive.Policy{KeepAlive: true, Idle: 280 * time.Second, MaxPings: 2,
 		MaxUSDPerPing: 0.25, MinPrefixTokens: 20000}
-	body := []byte(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`)
+	// A Claude-named model: relayServesClaude falls back to the model name when the endpoint
+	// (here, httptest's localhost) doesn't resolve to an anthropic.com host, and only keeps a
+	// relay warm for a Claude model — this fixture is Anthropic-via-relay on purpose, so it must
+	// name one.
+	body := []byte(`{"model":"claude-sonnet-5","messages":[{"role":"user","content":"hi"}]}`)
 	hdr := http.Header{"Authorization": {"Bearer sk-caller"}}
 	host := stripScheme(srv.URL)
 	// Two requests: a session's FIRST is not tracked (the gate skips it, matching recordFor's own
