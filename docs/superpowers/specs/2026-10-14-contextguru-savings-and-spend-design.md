@@ -97,6 +97,12 @@ part is `saved × newKeys / len(keys)`, and a component with no keys counts as u
 session rather than by tenant, because a provider cache is per conversation. The set is bounded
 (200,000 hashed entries, cleared when full, as `MarkUnique` is).
 
+Keys exist for Reformats and for Offloads that drop content without stashing it, which is how
+this plugin runs every Offload (it caps `marker_mode` at `summary`): the engine derives those keys
+from the changed messages' text (context-guru `components/pipeline.go`). Before it did, `dedup`
+and `extract_llm` had no keys here and counted as unique on every turn — 933k of 934k saved tokens
+in a 24-turn Sonnet 4.6 run, against 48k unique for the same engine in the proxy.
+
 No message text: the session API is unauthenticated, and `Trace.Changes` carries clipped
 before/after text, so it is never published.
 

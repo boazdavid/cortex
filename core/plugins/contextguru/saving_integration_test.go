@@ -38,11 +38,13 @@ func itRates(t *testing.T) *pricing.Registry {
 	return pricing.NewRegistry(tab)
 }
 
-// formatEngine reformats JSON tool output. format is a Reformat, so the engine keys each rewrite on
-// the content it rewrote (Report.CacheKeys), which is what lets a repeat be told from a first
-// sight. collapseEngine is no use here: with its config it drops content without stashing it, and
-// a keyless saving counts as unique on every turn (the engine's MarkUnique rule).
+// formatEngine reformats JSON tool output: a Reformat, which the engine keys on the content it
+// rewrote (Report.CacheKeys). That key is what lets a repeat be told from a first sight.
 const formatEngine = `{"engine":{"pipeline":["format"]}}`
+
+// collapseEngine (plugin_test.go) drops the output without stashing it, as dedup and extract_llm do
+// here: this plugin caps marker_mode at summary, so the engine stashes nothing. Such a run had no
+// key, and counted as unique on every turn, until the engine keyed it on the content too.
 
 // itToolOutput is indented JSON, which format compacts.
 func itToolOutput() string {
@@ -128,11 +130,17 @@ func itTurn(t *testing.T, pipe *pipeline.Pipeline, session string, body []byte, 
 //  3. A new session sending the same output is a first sight again.
 //
 // Before the fix every turn was priced like turn 1, which is how a long session reported about
-// five times the saving it made.
+// five times the saving it made. Run for a Reformat and for an Offload that stashes nothing.
 func TestIntegration_RepeatedCompactionIsPricedAsACacheRead(t *testing.T) {
+	for name, engine := range map[string]string{"reformat": formatEngine, "lossy offload": collapseEngine} {
+		t.Run(name, func(t *testing.T) { repeatScenario(t, engine) })
+	}
+}
+
+func repeatScenario(t *testing.T, engine string) {
 	pipe, err := plugins.BuildWithDeps([]config.PluginEntry{
 		{Name: "inference-parser"},
-		{Name: "context-guru", Config: json.RawMessage(formatEngine)},
+		{Name: "context-guru", Config: json.RawMessage(engine)},
 	}, plugins.Deps{Pricing: itRates(t)})
 	if err != nil {
 		t.Fatalf("build: %v", err)
