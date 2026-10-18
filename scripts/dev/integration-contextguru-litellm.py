@@ -27,7 +27,7 @@ Isolation: HOME is a temp dir, every listener is on a free 127.0.0.1 port in 487
 cost ledger and session archive are off, and only PIDs this script started are killed.
 
 Usage:
-  LITELLM_API_KEY=sk-... python3 -I scripts/dev/integration-contextguru-litellm.py [--keep] [--only D,A,S] [--s-window N]
+  LITELLM_API_KEY=sk-... python3 -I scripts/dev/integration-contextguru-litellm.py [--keep] [--only D,A,S] [--s-window N] [--shared]
 Needs: go, python3 on PATH. Spend: a few cents on haiku / gpt-5-mini / gpt-5.3-codex.
 """
 import argparse, json, os, re, shutil, signal, socket, ssl, subprocess, sys, tempfile, time
@@ -489,7 +489,76 @@ def s_part(i, rnd, n_chars):
     return "\n".join(lines)
 
 
-def run_summarize(binary, work, key, window):
+SHARED_CFG = os.path.expanduser("~/.cortex/config.yaml")
+
+
+class SharedCortex:
+    """The laptop's running Cortex, used in place of one this script starts (--shared). Nothing
+    is built, started or stopped; log() reads ~/.cortex/proxy.log from where the run began, so
+    earlier traffic cannot satisfy a check."""
+
+    def __init__(self):
+        self.log_path = os.path.expanduser("~/.cortex/proxy.log")
+        self.offset = os.path.getsize(self.log_path)
+        self.proc = None
+
+    def log(self):
+        with open(self.log_path, errors="replace") as f:
+            f.seek(self.offset)
+            return f.read()
+
+    def stop(self):
+        pass
+
+
+def shared_ports():
+    """(forward, session API, health, stats, transparent) from the laptop config."""
+    cfg = open(SHARED_CFG).read()
+    def port(key):
+        m = re.search(rf"^\s*{key}:\s*\"?[\w.]*:(\d+)", cfg, re.M)
+        return int(m.group(1)) if m else 0
+    stats = re.search(r"^stats:\s*\n\s+address:\s*\"?[\w.]*:(\d+)", cfg, re.M)
+    return (port("forward_proxy_addr"), port("session_api_addr"), port("health_addr"),
+            int(stats.group(1)) if stats else 0, port("transparent_proxy_addr"))
+
+
+def reload_count(stats_port):
+    try:
+        s = local_get(stats_port, "/reload/status")
+        return s.get("reloads_ok", 0), s.get("reloads_failed", 0)
+    except Exception:
+        return None
+
+
+def shared_window_override(stats_port, window):
+    """Adds a context_window block for S_MODEL to the laptop config's context-guru entry, waits
+    for the hot-reload, and returns the original text to restore. Only S_MODEL's window changes;
+    every other model keeps its own."""
+    orig = open(SHARED_CFG).read()
+    m = re.search(r"^(\s*)- name: context-guru\n(?:\1  .*\n)*?(\1    )engine:\n(?:\2  .*\n)+", orig, re.M)
+    if not m:
+        return None, "no context-guru entry with an engine: block in " + SHARED_CFG
+    ind = m.group(2)
+    block = (f"{ind}# TEMPORARY: integration test S (--shared); removed when the run ends.\n"
+             f"{ind}context_window:\n{ind}  windows:\n{ind}    \"{S_MODEL}\": {window}\n")
+    before = reload_count(stats_port)
+    with open(SHARED_CFG, "w") as f:
+        f.write(orig[:m.end()] + block + orig[m.end():])
+    for _ in range(30):
+        time.sleep(1)
+        now = reload_count(stats_port)
+        if now and before and now != before:
+            if now[1] > before[1]:
+                with open(SHARED_CFG, "w") as f:
+                    f.write(orig)
+                return None, "the shared Cortex refused the override; config restored"
+            return orig, ""
+    with open(SHARED_CFG, "w") as f:
+        f.write(orig)
+    return None, "no reload seen within 30 s; config restored"
+
+
+def run_summarize(binary, work, key, window, shared=False):
     """S*: grow one Anthropic session past 0.9 x window and watch cache_aware_summarizer act.
 
     Its own Cortex, so the window override and the debug log belong to this scenario alone. The
@@ -497,16 +566,25 @@ def run_summarize(binary, work, key, window):
     detached summary and forwards unchanged; a later turn finds it and splices it in."""
     import random
     rnd = random.Random(7)
-    ports = free_ports(5, lo=48750)
-    extra = (f"          context_window:\n            model_info: \"off\"\n"
-             f"            windows:\n              \"{S_MODEL}\": {window}\n")
-    cx = Cortex(binary, work, "cortex-s", config_yaml(ports, work, '            preset: "xhigh"', extra))
     sid = f"cgit-S-{os.getpid()}"
+    restore = None
+    if shared:
+        ports = shared_ports()
+        cx = SharedCortex()
+        restore, why = shared_window_override(ports[3], window)
+        if restore is None:
+            rec("S-start", "FAIL", why)
+            return
+    else:
+        ports = free_ports(5, lo=48750)
+        extra = (f"          context_window:\n            model_info: \"off\"\n"
+                 f"            windows:\n              \"{S_MODEL}\": {window}\n")
+        cx = Cortex(binary, work, "cortex-s", config_yaml(ports, work, '            preset: "xhigh"', extra))
     try:
-        if not wait_healthy(cx, ports[2]):
+        if not shared and not wait_healthy(cx, ports[2]):
             rec("S-start", "FAIL", "cortex did not become healthy: " + cx.log()[-400:].replace("\n", " "))
             return
-        ca = os.path.join(work, "ca", "ca.crt")
+        ca = os.path.expanduser("~/.cortex/ca/ca.crt") if shared else os.path.join(work, "ca", "ca.crt")
         for _ in range(50):
             if os.path.exists(ca):
                 break
@@ -540,8 +618,12 @@ def run_summarize(binary, work, key, window):
                 break
         log = cx.log()
         mine = [l for l in log.splitlines() if sid in l or "cache_aware" in l]
-        rec("S1-window", "PASS" if f"ctx_window={window}" in log else "FAIL",
-            f"engine saw ctx_window={window}" if f"ctx_window={window}" in log else "no cg.cache_boundary line with the configured window")
+        if shared:
+            # The laptop logs at INFO, and the window is only on cg.cache_boundary's DEBUG line.
+            rec("S1-window", "INFO", "not checkable at INFO level; S2 firing at 0.9 x the window shows it was used")
+        else:
+            rec("S1-window", "PASS" if f"ctx_window={window}" in log else "FAIL",
+                f"engine saw ctx_window={window}" if f"ctx_window={window}" in log else "no cg.cache_boundary line with the configured window")
         crossed = next((i + 1 for i, b in enumerate(billed) if b >= 0.9 * window), None)
         comm = [l for l in mine if "commissioned a detached summary" in l]
         declines = sorted(set(re.findall(r"cache_aware_summarizer[^\n]*?(?:reason|gate)=(\S+)", "\n".join(mine))))
@@ -568,6 +650,9 @@ def run_summarize(binary, work, key, window):
             json.dump({"window": window, "billed": billed}, f)
     finally:
         cx.stop()
+        if restore is not None:
+            with open(SHARED_CFG, "w") as f:
+                f.write(restore)
 
 
 def main():
@@ -579,6 +664,9 @@ def main():
                     "(list rates, assumed) so streamed OpenAI rows can be priced without the gateway header")
     ap.add_argument("--s-window", type=int, default=60000, help="S*: the exact context window given to "
                     f"{S_MODEL} via context_window.windows; the summary fires past 0.9 x this")
+    ap.add_argument("--shared", action="store_true", help="run D, K and S against the laptop's running "
+                    "Cortex (~/.cortex) instead of starting one; C and A are skipped. S adds a temporary "
+                    f"context_window override for {S_MODEL} and removes it when the run ends")
     ap.add_argument("--static-model", default="", help="also configure the plugin's static model: block with this model id")
     a = ap.parse_args()
     key = os.environ.get("LITELLM_API_KEY") or sys.exit("set LITELLM_API_KEY")
@@ -586,6 +674,12 @@ def main():
     want = lambda p: not only or any(o.startswith(p) for o in only)
     work = tempfile.mkdtemp(prefix="cg-litellm-")
     print(f"work dir: {work}", flush=True)
+    if a.shared:
+        try:
+            run_shared(a, key, work, want, only)
+        finally:
+            finish(a, work)
+        sys.exit(1 if any(r[1] == "FAIL" for r in RESULTS) else 0)
     binary = build(work); rec("build", "PASS", "cortex built (full + include_plugin_contextguru)")
     if want("C"):
         run_bad_config(binary, work)
@@ -625,16 +719,42 @@ def main():
             f.write("\n".join(l for l in log.splitlines() if "context-guru component" in l or "cache_aware" in l))
     finally:
         cx.stop()
-        with open(os.path.join(work, "tokens.json"), "w") as f:
-            json.dump({"preset": a.preset, "rows": TOKENS}, f, indent=1)
-        print("\n==== summary ====")
-        for r in RESULTS:
-            print(f"{r[1]:4} {r[0]:28} {r[2][:160]}")
-        fails = sum(1 for r in RESULTS if r[1] == "FAIL")
-        print(f"\n{fails} FAIL, {sum(1 for r in RESULTS if r[1] == 'GAP')} GAP; artifacts in {work}")
-        if not a.keep and fails == 0:
-            shutil.rmtree(work, ignore_errors=True)
+        finish(a, work)
     sys.exit(1 if any(r[1] == "FAIL" for r in RESULTS) else 0)
+
+
+def finish(a, work):
+    with open(os.path.join(work, "tokens.json"), "w") as f:
+        json.dump({"preset": a.preset, "rows": TOKENS}, f, indent=1)
+    print("\n==== summary ====")
+    for r in RESULTS:
+        print(f"{r[1]:4} {r[0]:28} {r[2][:160]}")
+    fails = sum(1 for r in RESULTS if r[1] == "FAIL")
+    print(f"\n{fails} FAIL, {sum(1 for r in RESULTS if r[1] == 'GAP')} GAP; artifacts in {work}")
+    if not a.keep and fails == 0:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def run_shared(a, key, work, want, only):
+    """--shared: the laptop's running Cortex instead of one this script starts. C needs a Cortex
+    this script can start and break, and A needs keep_alive on with an 8 s idle, which the laptop
+    config does not have, so both are skipped. D, K and S run, and every session they make shows
+    in agentop observe under its cgit-* id."""
+    ports = shared_ports()
+    cx = SharedCortex()
+    op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        op.open(f"http://127.0.0.1:{ports[2]}/healthz", timeout=3).read()
+    except Exception as e:
+        rec("start", "FAIL", f"shared Cortex not healthy on :{ports[2]}: {e}")
+        return
+    ca = os.path.expanduser("~/.cortex/ca/ca.crt")
+    rec("start", "PASS", f"shared Cortex; forward :{ports[0]} session API :{ports[1]}; C and A skipped")
+    if want("D"):
+        dsel = [o for o in only if o.startswith("D") and len(o) > 1]
+        run_matrix(cx, ports, ca, key, work, dsel, "", a.preset)
+    if want("S"):
+        run_summarize(None, work, key, a.s_window, shared=True)
 
 
 if __name__ == "__main__":
