@@ -15,7 +15,7 @@ import (
 // `agentop configure status` prints.
 //
 // FOUR values, not a bool, and configureUnknown is not a flavour of "no". Every one of the
-// five agents already distinguishes a case where agentop cannot answer from one where
+// four agents already distinguishes a case where agentop cannot answer from one where
 // it can answer "not routed", and collapsing those loses the only part that tells a
 // user what to do next:
 //
@@ -23,10 +23,10 @@ import (
 //     file is neither enabled (a session would miss the CA) nor untouched.
 //   - bob states this outright with three package-level strings, bobStatusUnknown
 //     among them: with no settings document there is nothing to make a claim about.
+//     Its shell half can see the exported variable but never the shell's function
+//     table, so "the variable is set" is not "bob runs through Cortex" either.
 //   - opencode cannot read Cortex's config to compare against, or cannot run the
 //     opencode CLI at all; the keys it can see say nothing on their own.
-//   - bobshell can see the exported variable but never the shell's function table,
-//     so "the variable is set" is not "bob runs through Cortex".
 //
 // The issue's mockup asked for exactly this with its `uncertain` row (#1164).
 type configureState int
@@ -72,7 +72,7 @@ func (s configureState) String() string {
 //
 // Detail is ONE LINE and no more. The per-agent `status` commands print paragraphs —
 // bob's runs to a verdict, a liveness warning, a detail block and a CA note — and the
-// whole value of the table is that five agents fit on five lines. Anyone who wants the
+// whole value of the table is that four agents fit on four lines. Anyone who wants the
 // paragraph has `agentop configure <agent> status`, which the table's footer says.
 type configureStatus struct {
 	Agent  string
@@ -84,12 +84,12 @@ type configureStatus struct {
 // configureUsage lists them.
 //
 // A slice of closures rather than a switch inside the renderer, because the thing
-// that must be true of this list is that it matches configureUsage's five agents —
+// that must be true of this list is that it matches configureUsage's four agents —
 // and a list is what a test can compare against that usage text
 // (TestConfigureStatusTable_CoversEveryAgentInUsage).
 //
 // home is passed in rather than read per agent: runConfigureStatus has already failed
-// if it is unavailable, and five separate os.UserHomeDir() calls would be five places
+// if it is unavailable, and four separate os.UserHomeDir() calls would be four places
 // for that failure to be handled differently.
 //
 // Each closure takes the HOME DIRECTORY and resolves its own agent's paths from it,
@@ -104,18 +104,8 @@ func configureStatusFuncs() []func(home string) configureStatus {
 			return claudeCodeState(filepath.Join(home, settingsRel))
 		},
 		func(home string) configureStatus {
-			cfg := filepath.Join(home, cortexCfgRel)
-			settings, err := bobSettingsPath(home)
-			if err != nil {
-				// Not an error row for the whole table and not "not enabled" either:
-				// on a platform where IBM Bob's settings path is not known, agentop
-				// has not looked at a file and must not report as though it had.
-				return configureStatus{Agent: "bob", State: configureUnknown, Detail: err.Error()}
-			}
-			wantProxy, _ := bobWanted(cfg, home)
-			return bobState(settings, cfg, wantProxy)
+			return bobRow(home)
 		},
-		func(string) configureStatus { return bobShellState() },
 		func(home string) configureStatus {
 			bin, err := findOpenCode()
 			if err != nil {
@@ -141,14 +131,14 @@ func configureStatusFuncs() []func(home string) configureStatus {
 // a configureStatus and no error, so a missing settings file, an unreadable Cortex
 // config or an absent opencode binary becomes an "uncertain" row with the reason in
 // its detail column — which is the answer someone ran this to get, since the common
-// case is that most of the five agents are not installed at all. Pinned by
+// case is that most of the four agents are not installed at all. Pinned by
 // TestConfigureStatusTable_OneAgentsMissingConfigDoesNotBreakTheTable.
 //
 // Exit 0 whatever the rows say, on the same reasoning every per-agent status uses: a
 // report of "not enabled" is a successful report, and a non-zero status here would
 // make the command unusable in a pipeline.
 func runConfigureStatus(args []string, stdout, stderr io.Writer) int {
-	// No flags of its own, deliberately. Five agents read five different files and the
+	// No flags of its own, deliberately. Four agents read four different files and the
 	// per-agent overrides (--settings, --env, --config, --opencode) do not compose into
 	// one flag set — `--config` alone is Cortex's config for three agents and the
 	// agent's own for a fourth. Anyone who needs to point at a non-default path wants
@@ -279,7 +269,12 @@ func claudeCodeStateFrom(settingsPath string, doc map[string]any, err error) con
 // configureOff, because it is the one "no" that is about Cortex: something configured
 // this and the port moved. bobStatus prints two paragraphs about that case; this is
 // the one-word version of them.
-func bobState(settingsPath, cortexCfgPath, wantProxy string) configureStatus {
+//
+// On macOS, bobOurs is configureOn only with the launch half in place too —
+// http.systemCertificates false and the shell block present (bobLaunchCheck). Without
+// them the proxy is set but Bob's extensions cannot read Cortex's CA, which is a
+// Cortex configuration started and not finished: configurePartial.
+func bobState(settingsPath, cortexCfgPath, wantProxy string, launch bobLaunch, caPath string) configureStatus {
 	row := func(s configureState, detail string) configureStatus {
 		return configureStatus{Agent: "bob", State: s, Detail: detail}
 	}
@@ -306,7 +301,7 @@ func bobState(settingsPath, cortexCfgPath, wantProxy string) configureStatus {
 		// identical case, and the distinction this table exists to draw.
 		return row(configureUnknown, err.Error())
 	}
-	return bobStateFrom(settingsPath, doc, cortexCfgPath, wantProxy)
+	return bobStateFrom(settingsPath, doc, cortexCfgPath, wantProxy, launch, caPath)
 }
 
 // bobStateFrom is bobState over a settings document already read.
@@ -322,7 +317,7 @@ func bobState(settingsPath, cortexCfgPath, wantProxy string) configureStatus {
 // question about the FILE rather than about a document — whether it exists at all, and
 // whether it defines the key twice, which a decoded map can no longer answer. bobStatus
 // asks those two itself, before this, and answers them in its own words.
-func bobStateFrom(settingsPath string, doc map[string]any, cortexCfgPath, wantProxy string) configureStatus {
+func bobStateFrom(settingsPath string, doc map[string]any, cortexCfgPath, wantProxy string, launch bobLaunch, caPath string) configureStatus {
 	row := func(s configureState, detail string) configureStatus {
 		return configureStatus{Agent: "bob", State: s, Detail: detail}
 	}
@@ -335,6 +330,11 @@ func bobStateFrom(settingsPath string, doc map[string]any, cortexCfgPath, wantPr
 	}
 	switch bobOwns(existing, wantProxy) {
 	case bobOurs:
+		if launch.macOS {
+			if ok, problems := bobLaunchCheck(launch, caPath, doc); !ok {
+				return row(configurePartial, problems[0])
+			}
+		}
 		return row(configureOn, fmt.Sprintf("%q=%s", bobProxyKey, existing))
 	case bobUnknown:
 		return row(configureUnknown, fmt.Sprintf("%q=%s is a loopback proxy, but %s is not readable",
@@ -347,25 +347,90 @@ func bobStateFrom(settingsPath string, doc map[string]any, cortexCfgPath, wantPr
 	}
 }
 
+// bobRow is the merged bob row: the editor half's verdict and the shell half's,
+// combined, because the agent is one agent with two faces and the table gives it one
+// line. See runBob for the command side of the same convergence.
+//
+// THE COMBINATION RULE is bobRowState's, spelled out there and pinned by
+// TestBobRowState: stronger findings win, the row is enabled only when both halves
+// are, and reporting "not enabled" for a half that was never looked at would be a
+// finding agentop did not make.
+//
+// The detail line carries BOTH halves' own details, each named, because the one-word
+// verdict cannot say which half is missing — and "run configure bob enable" is only
+// actionable advice when the reader can see which half it would change.
+func bobRow(home string) configureStatus {
+	cfg := filepath.Join(home, cortexCfgRel)
+	var ide configureStatus
+	settings, err := bobSettingsPath(home)
+	if err != nil {
+		// Not an error row for the whole table and not "not enabled" either:
+		// on a platform where IBM Bob's settings path is not known, agentop
+		// has not looked at a file and must not report as though it had.
+		ide = configureStatus{State: configureUnknown, Detail: err.Error()}
+	} else {
+		wantProxy, caPath := bobWanted(cfg, home)
+		ide = bobState(settings, cfg, wantProxy, resolveBobLaunch(home, os.Getenv("SHELL")), caPath)
+	}
+	shell := bobShellState()
+	return configureStatus{
+		Agent:  "bob",
+		State:  bobRowState(ide.State, shell.State),
+		Detail: "editor: " + ide.Detail + "; shell: " + shell.Detail,
+	}
+}
+
+// bobRowState is the combination rule bobRow's doc comment spells out, as a function
+// so the table test can pin it without standing up a home directory. Stronger
+// findings win, in this order:
+//
+//	on only when both halves are on — the row claims nothing a half contradicts.
+//	    The shell half's own best is "partly enabled" (its state function refuses
+//	    to claim more from an inherited variable), so in practice this row tops
+//	    out at "partly enabled" with the editor on and the shell's variable set —
+//	    the same honesty bobShellState pins for itself, kept rather than smoothed
+//	    over, with the confirmation step named in the detail line.
+//	one half on is "partly enabled", which is what enable has left to do — and so
+//	    is any half's "partly enabled", which beats an unreadable half: positive
+//	    evidence outranks no evidence.
+//	neither, but a half agentop could not read, is "uncertain" — the same refusal
+//	    to report "not enabled" for a half that was never looked at.
+//	otherwise "not enabled".
+func bobRowState(ide, shell configureState) configureState {
+	switch {
+	case ide == configureOn && shell == configureOn:
+		return configureOn
+	case ide == configureOn || shell == configureOn:
+		return configurePartial
+	case ide == configurePartial || shell == configurePartial:
+		return configurePartial
+	case ide == configureUnknown || shell == configureUnknown:
+		return configureUnknown
+	default:
+		return configureOff
+	}
+}
+
 // bobShellState is the bob shell function's verdict as data.
 //
-// NEVER configureOn, and that is the whole point of modelling this one. bobShellStatus
-// spends a paragraph on why: the exported variable is inherited by every child
-// process, including a non-interactive subshell that never reads the rc file and so
-// has no bob function at all. agentop is itself such a child, and a shell's function
-// table is never exported — so "the variable is set" is evidence and not a verdict,
-// and configurePartial is what that is. Reporting "enabled" from an inherited variable
-// is exactly the confident wrong answer bobShellStatus's comment refuses to give.
+// NEVER configureOn, and that is the whole point of modelling this one.
+// bobShellStatusLine says why in one line: the exported variable is inherited by
+// every child process, including a non-interactive subshell that never reads the
+// rc file and so has no bob function at all. agentop is itself such a child, and
+// a shell's function table is never exported — so "the variable is set" is
+// evidence and not a verdict, and configurePartial is what that is. Reporting
+// "enabled" from an inherited variable is exactly the confident wrong answer
+// that line's "run \"type bob\" to confirm" hedge exists to avoid.
 func bobShellState() configureStatus {
 	if v, ok := os.LookupEnv(bobShellEnvVar); ok {
 		return configureStatus{
-			Agent:  "bobshell",
+			Agent:  "bob",
 			State:  configurePartial,
 			Detail: fmt.Sprintf("%s=%s; run \"type bob\" to confirm the function in your shell", bobShellEnvVar, v),
 		}
 	}
 	return configureStatus{
-		Agent:  "bobshell",
+		Agent:  "bob",
 		State:  configureOff,
 		Detail: bobShellEnvVar + " is unset in this shell",
 	}

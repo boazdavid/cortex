@@ -483,8 +483,9 @@ func TestUninstallUnroutesBobAndTheBobShell(t *testing.T) {
 	sc := newUninstallScene(t)
 	sc.setUp(t)
 	rc := filepath.Join(sc.home, ".zshrc")
-	if code := bobShellEnable(rc, true, io.Discard, io.Discard); code != 0 || strings.Count(readFile(t, rc), bobShellBlock) != 1 {
-		t.Fatalf("fixture: bobshell enable exit %d", code)
+	enableBobShellAt(t, rc)
+	if strings.Count(readFile(t, rc), bobShellBlock) != 1 {
+		t.Fatal("fixture: the bobshell block did not land exactly once")
 	}
 	bob := ""
 	if runtime.GOOS == "darwin" {
@@ -639,9 +640,7 @@ func TestUninstallLeavesAnEditedBobShellBlock(t *testing.T) {
 	sc := newUninstallScene(t)
 	sc.setUp(t, "--no-modify-path")
 	rc := filepath.Join(sc.home, ".zshrc")
-	if code := bobShellEnable(rc, true, io.Discard, io.Discard); code != 0 {
-		t.Fatalf("fixture: bobshell enable exit %d", code)
-	}
+	enableBobShellAt(t, rc)
 	edited := strings.Replace(readFile(t, rc), `agentop exec -- bob "$@"`, `agentop exec -- bob --verbose "$@"`, 1)
 	if edited == readFile(t, rc) {
 		t.Fatal("fixture: nothing to edit in the block")
@@ -1396,9 +1395,7 @@ func TestUninstallNamesTheFixForEachFailure(t *testing.T) {
 			return `remove "` + bobProxyKey + `" from ` + (&setupEnv{home: sc.home}).tilde(bob)
 		}},
 		{"the bob shell function", "removed", nil, nil, false, func(t *testing.T, sc setupScene) string {
-			if code := bobShellEnable(filepath.Join(sc.home, ".zshrc"), true, io.Discard, io.Discard); code != 0 {
-				t.Fatalf("fixture: bobshell enable exit %d", code)
-			}
+			enableBobShellAt(t, filepath.Join(sc.home, ".zshrc"))
 			failRemovalWhere(t, func(r removal) bool { return r.item.What == "the bob shell function" })
 			return `delete the lines from "` + bobShellMarkerStart + `" to "` + bobShellMarkerEnd + `" in ~/.zshrc`
 		}},

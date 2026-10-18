@@ -17,6 +17,7 @@ import (
 	"github.com/rossoctl/cortex/cmd/agentop/apiclient"
 	"github.com/rossoctl/cortex/cmd/agentop/edit"
 	"github.com/rossoctl/cortex/cmd/agentop/servers"
+	"github.com/rossoctl/cortex/core/pipeline"
 	"github.com/rossoctl/cortex/core/plugins/inferencerouter/routerconfig"
 	"github.com/rossoctl/cortex/core/session"
 )
@@ -130,7 +131,7 @@ func serverAdd(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	// what it protects cannot drift apart. A server replaced under its own name keeps its host.
 	if other, ok := servers.ForHost(c, ep.Host); ok && other != name {
 		fmt.Fprintf(stderr, "agentop server add: %s is already on %s. Each server needs a host of its own, "+
-			"because agentop names a session's server from the host its requests went to.\n", other, ep.Hostname)
+			"because agentop names a session's server from the host its requests went to.\n", other, ep.Key())
 		return 1
 	}
 	old, replacing := c.Servers[name]
@@ -191,7 +192,7 @@ func serverAdd(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(agentsOn(c, name)) == 0 {
 		done += " No agent uses it yet: press S on agentop's agents pane, or run\n  agentop server use " + name + " --agent claude-code"
 	}
-	return runServerWrite(stdout, stderr, path, statsURL, ch, writeReport{
+	return runServerWrite(stdout, stderr, path, statsURL, []edit.ConfigChange{ch}, writeReport{
 		done:      done,
 		unchanged: name + " already has that URL, key and models; nothing to change.",
 		note:      routerInactive(cfg, path),
@@ -286,7 +287,7 @@ func serverRemove(args []string, stdout, stderr io.Writer) int {
 			"there gets an error asking for a new session, until %s is added back.\n", runningSessions(n), name, name)
 	}
 	ch := edit.ConfigChange{Chain: "outbound", Plugin: routerName, Path: []string{"servers", name}}
-	return runServerWrite(stdout, stderr, path, statsURL, ch, writeReport{
+	return runServerWrite(stdout, stderr, path, statsURL, []edit.ConfigChange{ch}, writeReport{
 		done: "Removed " + name + ".",
 		live: fmt.Sprintf("A session the proxy routed to it now gets an error asking for a new session. "+
 			"Adding %s back routes them to it again.", name),
@@ -361,6 +362,9 @@ func serverUse(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "agentop server use: %v\n", err)
 		return 2
 	}
+	// The canonical spelling, so the key this command writes and the messages it
+	// prints name the agent today's requests report, however the user spelled it.
+	*agent = pipeline.CanonicalAgent(*agent)
 	cfg, path, statsURL, err := serverTarget(*cfgPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "agentop server use: %v\n", err)
@@ -376,8 +380,7 @@ func serverUse(args []string, stdout, stderr io.Writer) int {
 			name, configuredServers(c), name)
 		return 1
 	}
-	ch := servers.AgentChange(*agent, name)
-	return runServerWrite(stdout, stderr, path, statsURL, ch, writeReport{
+	return runServerWrite(stdout, stderr, path, statsURL, servers.AgentChanges(*agent, name), writeReport{
 		done:      fmt.Sprintf("New %s sessions → %s.", *agent, name),
 		live:      runningSessionsStay,
 		unchanged: fmt.Sprintf("New %s sessions already go to %s.", *agent, name),
@@ -401,6 +404,9 @@ func serverReset(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "agentop server reset: %v\n", err)
 		return 2
 	}
+	// The canonical spelling, for the same reason as use: the check below and the
+	// key the reset removes must name the agent the router routes.
+	*agent = pipeline.CanonicalAgent(*agent)
 	cfg, path, statsURL, err := serverTarget(*cfgPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "agentop server reset: %v\n", err)
@@ -415,8 +421,7 @@ func serverReset(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "%s is not routed; nothing to change.\n", *agent)
 		return 0
 	}
-	ch := servers.AgentChange(*agent, "")
-	return runServerWrite(stdout, stderr, path, statsURL, ch, writeReport{
+	return runServerWrite(stdout, stderr, path, statsURL, servers.AgentChanges(*agent, ""), writeReport{
 		done:      fmt.Sprintf("New %s sessions are no longer routed.", *agent),
 		live:      runningSessionsStay,
 		unchanged: fmt.Sprintf("%s is not routed; nothing to change.", *agent),
@@ -442,10 +447,12 @@ type writeReport struct {
 	note string
 }
 
-// runServerWrite makes one change to the router entry and reports how it landed.
-func runServerWrite(stdout, stderr io.Writer, path, statsURL string, ch edit.ConfigChange, r writeReport) int {
+// runServerWrite applies changes to the router entry — one agent's changes can be
+// several, a removal per retired spelling plus the canonical set — and reports how
+// the write landed.
+func runServerWrite(stdout, stderr io.Writer, path, statsURL string, changes []edit.ConfigChange, r writeReport) int {
 	res, err := writePluginConfig(context.Background(), edit.ConfigWrite{
-		Path: path, StatsURL: statsURL, Changes: []edit.ConfigChange{ch}, Verify: servers.Verify,
+		Path: path, StatsURL: statsURL, Changes: changes, Verify: servers.Verify,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "agentop server: %v\n", err)

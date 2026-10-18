@@ -227,6 +227,10 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 				return m.cycleSpendAxis()
 			}
 		case "w":
+			// The agents pane's window, drawer open or closed; see cycleAgentsWindow.
+			if m.pane == paneAgents {
+				return m.cycleAgentsWindow()
+			}
 			if m.spendDrawerVisible() {
 				return m.cycleSpendWindow()
 			}
@@ -766,6 +770,21 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		// detail viewport pages too.
 		return m.pageActivePane(msg)
 
+	case "x":
+		// Erase the row under the cursor, after a confirmation: the highlighted session on the
+		// sessions pane, every session of the highlighted agent on the agents pane — on All agents,
+		// everything, which is X's confirmation. Off the footer, like X — the `?` overlay names it.
+		if m.client == nil {
+			return nil
+		}
+		switch m.pane {
+		case paneSessions:
+			return m.openSessionErase()
+		case paneAgents:
+			return m.openAgentErase()
+		}
+		return nil
+
 	case "X":
 		// Clear all history, after a confirmation. Capital, and off the footer like `A`: a
 		// destructive key should not be one stray press of a common letter, nor advertised on
@@ -1260,7 +1279,11 @@ func (m *model) helpView() string {
 		if m.serverKeyOffered() {
 			serverHint = "  [S] server"
 		}
-		return "[↑↓] nav" + enterHint + escHint + serverHint + "  " + m.searchHints(m.pane) + "  [?] keys  [q] quit"
+		// [$] SPEND, for the same reason the sessions footer carries it: the footer is where a
+		// key gets discovered. The drawer here breaks down the row under the cursor.
+		spendHint := "  [$] spend"
+		// [w] the pane's window, which the title names; see cycleAgentsWindow.
+		return "[↑↓] nav" + enterHint + escHint + serverHint + "  [w] window" + spendHint + "  " + m.searchHints(m.pane) + "  [?] keys  [q] quit"
 	}
 	return "[?] keys  [q] quit"
 }

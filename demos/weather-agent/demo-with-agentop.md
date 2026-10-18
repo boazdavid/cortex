@@ -41,7 +41,7 @@ Verify by sending one chat message and getting a weather response. Once that wor
 
 Download a prebuilt `agentop` (linux/macOS, amd64/arm64) from the
 [Releases page](https://github.com/rossoctl/cortex/releases) — see
-[Download prebuilt binaries](../../docs/architecture.md#download-prebuilt-binaries) for verify + macOS
+[Download prebuilt binaries](../../CONTRIBUTING.md#prebuilt-release-binaries) for verify + macOS
 quarantine steps — and put it on your PATH.
 
 Or build it from source:

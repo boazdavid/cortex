@@ -125,9 +125,11 @@ list. Claude Code is the only agent it can build a list for. See
 
 ## Switching inference servers
 
-With more than one LiteLLM server, `agentop server` — or `S` on agentop's agents
-pane — chooses which one Claude Code's **new** sessions use, with one Claude Code
-configuration and without restarting anything. A running conversation stays on
+With more than one inference server — a LiteLLM gateway, or a local model
+server such as Ollama ([setting one up](../laptop-local-model.md)) —
+`agentop server` — or `S` on agentop's agents pane — chooses which one Claude
+Code's **new** sessions use, with one Claude Code configuration and without
+restarting anything. A running conversation stays on
 the server it started on, with the exceptions below.
 See [Choosing an inference server](../../cmd/agentop/README.md#choosing-an-inference-server-agentop-server).
 

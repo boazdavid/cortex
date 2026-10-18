@@ -1006,8 +1006,7 @@ type SessionSummary struct {
 	//
 	// GENERIC, NOT THE ROUTER'S: it says where a session's inference goes with or without the
 	// inference-router. agentop names a session's server from it, which is why the router refuses
-	// two servers on one host. A host[:port] as the request carried it, so compare it
-	// port-stripped and lowercased.
+	// two servers on one host. A host[:port] as the request carried it.
 	//
 	// CONTINUES ACROSS A RESTART WHERE A SESSION ARCHIVE RUNS, like Title: the archive's fold
 	// persists it, and a resumed session reports it until its own next inference request.
@@ -1340,6 +1339,18 @@ func (s *Store) rekeyLocked(oldID, newID string) bool {
 	return true
 }
 
+// removeLocked drops id's entry and every map that names it: its owner, its adoption records and
+// the active-session mark. Eviction, ttl expiry and Delete all remove a session through it. s.mu
+// held.
+func (s *Store) removeLocked(id string) {
+	delete(s.sessions, id)
+	delete(s.owners, id)
+	s.forgetAdoptedLocked(id)
+	if s.activeID == id {
+		s.activeID = ""
+	}
+}
+
 // Cleanup removes expired sessions. Safe for concurrent use.
 func (s *Store) Cleanup() {
 	s.mu.Lock()
@@ -1350,12 +1361,7 @@ func (s *Store) Cleanup() {
 func (s *Store) cleanupLocked(now time.Time) {
 	for id, sess := range s.sessions {
 		if s.isExpired(sess, now) {
-			delete(s.sessions, id)
-			delete(s.owners, id)
-			s.forgetAdoptedLocked(id)
-			if s.activeID == id {
-				s.activeID = ""
-			}
+			s.removeLocked(id)
 		}
 	}
 }
@@ -1375,12 +1381,9 @@ func (s *Store) evictOldestLocked() {
 	if oldestID == "" {
 		// All sessions are the active session — evict it as last resort.
 		oldestID = s.activeID
-		s.activeID = ""
 	}
 	if oldestID != "" {
-		delete(s.sessions, oldestID)
-		delete(s.owners, oldestID)
-		s.forgetAdoptedLocked(oldestID)
+		s.removeLocked(oldestID)
 	}
 }
 

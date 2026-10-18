@@ -775,3 +775,77 @@ func TestServerRemove_WarnsOfOneSessionInTheSingularAndShowsNoCredential(t *test
 		}
 	}
 }
+
+// The router folds retired agent spellings when it reads agents:, so agentop's own
+// reads and writes of the same map must fold too — otherwise `server reset --agent bob`
+// on a config written before the rename reports "not routed" while the proxy keeps
+// routing, and a use-then-reset leaves the retired key shadowing today's spelling.
+func TestServerReset_ARetiredSpellingIsStillRouted(t *testing.T) {
+	block := strings.Replace(routerBlock, "            claude-code: glm\n", "            bob-shell: glm\n", 1)
+	path := serverEnv(t, newFakeStats(t, 0).addr(), block)
+	code, out, errOut := runServerCmd(t, "", "reset", "--agent", "bob", "--config", path)
+	if code != 0 || !strings.Contains(out, "New bob sessions are no longer routed.") {
+		t.Fatalf("exit %d, stdout:\n%s%s", code, out, errOut)
+	}
+	if got := readConfig(t, path); strings.Contains(got, "agents:") || strings.Contains(got, "bob-shell") {
+		t.Errorf("the retired spelling survived the reset:\n%s", got)
+	}
+}
+
+// use then reset must leave nothing behind: a config naming the retired spelling
+// gets the whole agents: map rewritten under today's spellings, so no shadowed key
+// resumes routing after a reset that reported success.
+func TestServerUseAndReset_RetiredSpellingsLeaveNoShadowedKey(t *testing.T) {
+	block := strings.Replace(routerBlock, "            claude-code: glm\n", "            bob-shell: glm\n", 1)
+	path := serverEnv(t, newFakeStats(t, 0).addr(), block)
+	if code, out, errOut := runServerCmd(t, "", "use", "ete", "--agent", "bob", "--config", path); code != 0 {
+		t.Fatalf("use: exit %d, stdout:\n%s%s", code, out, errOut)
+	}
+	if got := readConfig(t, path); !strings.Contains(got, "bob: ete") || strings.Contains(got, "bob-shell") {
+		t.Fatalf("use left the retired spelling in the config:\n%s", got)
+	}
+	if code, out, errOut := runServerCmd(t, "", "reset", "--agent", "bob", "--config", path); code != 0 {
+		t.Fatalf("reset: exit %d, stdout:\n%s%s", code, out, errOut)
+	}
+	if got := readConfig(t, path); strings.Contains(got, "agents:") || strings.Contains(got, "bob-shell") {
+		t.Errorf("a shadowed key survived the reset:\n%s", got)
+	}
+}
+
+// The --agent parameter folds too: naming a retired spelling routes today's, and
+// writes the config under the spelling the router and every view report.
+func TestServerUse_FoldsARetiredAgentParam(t *testing.T) {
+	path := serverEnv(t, newFakeStats(t, 0).addr(), routerBlock)
+	code, out, errOut := runServerCmd(t, "", "use", "ete", "--agent", "bob-shell", "--config", path)
+	if code != 0 || !strings.Contains(out, "New bob sessions → ete.") {
+		t.Fatalf("exit %d, stdout:\n%s%s", code, out, errOut)
+	}
+	if got := readConfig(t, path); !strings.Contains(got, "bob: ete") || strings.Contains(got, "bob-shell") {
+		t.Errorf("config:\n%s", got)
+	}
+}
+
+// An agent's write touches only that agent's spellings: a sibling key — its value,
+// its order, a comment beside it — survives byte for byte. The whole-agents-map
+// replacement this replaces rewrote the block, so a concurrent write for another
+// agent (or a hand edit) was silently reverted from the snapshot the command read.
+func TestServerUse_LeavesSiblingAgentsByteIdentical(t *testing.T) {
+	block := strings.Replace(routerBlock, "          agents:\n            claude-code: glm\n",
+		"          agents:\n            # claude goes to glm\n            claude-code: glm\n            opencode: ete\n", 1)
+	path := serverEnv(t, newFakeStats(t, 0).addr(), block)
+	if code, out, errOut := runServerCmd(t, "", "use", "ete", "--agent", "bob", "--config", path); code != 0 {
+		t.Fatalf("exit %d, stdout:\n%s%s", code, out, errOut)
+	}
+	got := readConfig(t, path)
+	for _, want := range []string{
+		"            # claude goes to glm\n            claude-code: glm\n            opencode: ete\n",
+		"            bob: ete\n",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("config lost a sibling key's bytes:\n%s", got)
+		}
+	}
+	if strings.Contains(got, "bob-shell") {
+		t.Errorf("the retired spelling survived:\n%s", got)
+	}
+}

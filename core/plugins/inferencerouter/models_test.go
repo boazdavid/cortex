@@ -844,3 +844,152 @@ func TestResend_LearnsOnlyAPlausibleLimitFromTheErrorMessage(t *testing.T) {
 		})
 	}
 }
+
+// Local model servers refuse a model they do not have in their own words. Each body
+// is a server's answer as recorded on 2026-10-15 (see the spec), and each refuses the
+// name it carries.
+func TestRefusesModel_ReadsEachLocalServersWording(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		model  string
+		body   string
+	}{
+		{"ollama chat completions", 404, "premium-ide", `{"error":{"message":"model 'premium-ide' not found","type":"not_found_error","param":null,"code":null}}`},
+		{"ollama 0.7.0 chat completions", 404, "premium-ide", `{"error":{"message":"model \"premium-ide\" not found, try pulling it first","type":"api_error","param":null,"code":null}}`},
+		{"ollama messages", 404, "premium-ide", `{"type":"error","error":{"type":"not_found_error","message":"model 'premium-ide' not found"},"request_id":"req_0291eb92e74aac2c0064755e"}`},
+		{"ollama responses", 404, "claude-opus-5-5", `{"error":{"message":"model 'claude-opus-5-5' not found","type":"not_found_error","param":null,"code":null}}`},
+		{"ollama, a name with a tag and a namespace", 404, "ibm/granite4:latest", `{"error":{"message":"model 'ibm/granite4:latest' not found","type":"not_found_error","param":null,"code":null}}`},
+		{"ollama, a name with a percent sign", 404, "100%-local", `{"error":{"message":"model '100%-local' not found","type":"not_found_error","param":null,"code":null}}`},
+		{"llama.cpp with --models-dir", 400, "premium-ide", `{"error":{"code":400,"message":"model 'premium-ide' not found","type":"invalid_request_error"}}`},
+		{"vllm chat completions and responses", 404, "premium-ide", "{\"error\":{\"message\":\"The model `premium-ide` does not exist.\",\"type\":\"NotFoundError\",\"param\":\"model\",\"code\":404}}"},
+		{"vllm messages", 404, "premium-ide", "{\"type\":\"error\",\"error\":{\"type\":\"NotFoundError\",\"message\":\"The model `premium-ide` does not exist.\"}}"},
+		{"litellm, a team-restricted key", 403, "exo-free", refusal},
+		{"litellm, an unrestricted key", 400, "exo-free", `{"error":{"message":"/chat/completions: Invalid model name passed in model=exo-free."}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if !refusesModel(tc.status, []byte(tc.body), tc.model) {
+				t.Errorf("refusesModel(%d, %s, %q) = false, want a refusal", tc.status, tc.body, tc.model)
+			}
+		})
+	}
+}
+
+// What is not a refusal of the model sent reaches the agent as the server answered it.
+func TestRefusesModel_OtherAnswersAreNotRefusals(t *testing.T) {
+	ollama := `{"error":{"message":"model 'premium-ide' not found","type":"not_found_error","param":null,"code":null}}`
+	vllm := "{\"error\":{\"message\":\"The model `premium-ide` does not exist.\",\"type\":\"NotFoundError\",\"param\":\"model\",\"code\":404}}"
+	for _, tc := range []struct {
+		name   string
+		status int
+		model  string
+		body   string
+	}{
+		{"ollama, a path it does not serve", 404, "premium-ide", `404 page not found`},
+		{"vllm, a path it does not serve", 404, "premium-ide", `{"detail":"Not Found"}`},
+		{"llama.cpp, a path it does not serve", 404, "premium-ide", `{"error":{"message":"File Not Found","type":"not_found_error","code":404}}`},
+		{"lm studio, a path it does not serve", 200, "premium-ide", `{"error":"Unexpected endpoint or method. (POST /v1/nope)"}`},
+		{"lm studio with nothing loaded", 400, "premium-ide", `{"error":{"message":"No models loaded. Please load a model in the developer page or use the 'lms load' command.","type":"invalid_request_error","param":"model","code":null}}`},
+		{"another model named", 404, "granite3.3", ollama},
+		{"a name the refused one starts with", 404, "qwen3", `{"error":{"message":"model 'qwen3:4b' not found","type":"not_found_error","param":null,"code":null}}`},
+		{"a name the refused one starts with, ollama 0.7.0's quoting", 404, "qwen3", `{"error":{"message":"model \"qwen3:4b\" not found, try pulling it first","type":"api_error","param":null,"code":null}}`},
+		{"ollama's phrase at a status not recorded", 500, "premium-ide", ollama},
+		{"vllm's phrase at a status not recorded", 400, "premium-ide", vllm},
+		{"no model sent", 404, "", `{"error":{"message":"model '' not found"}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if refusesModel(tc.status, []byte(tc.body), tc.model) {
+				t.Errorf("refusesModel(%d, %s, %q) = true, want no refusal", tc.status, tc.body, tc.model)
+			}
+		})
+	}
+}
+
+// A local server's refusal is resent with the server's own model, as LiteLLM's is.
+func TestResend_TreatsALocalServersMissingModelAsARefusal(t *testing.T) {
+	_, p := buildRouter(t, wordConfig(`"opencode": "glm"`))
+	pctx := chat(newStore(t), "opencode.ai", "/zen/v1/chat/completions", opencodeUA, "s1", "exo-free", true)
+	run(t, p, pctx)
+	if !resend(p, pctx, http.StatusNotFound, `{"error":{"message":"model 'exo-free' not found","type":"not_found_error","param":null,"code":null}}`) {
+		t.Fatal("Resend = false for Ollama's refusal of the model sent")
+	}
+	if got := sentModel(t, pctx); got != glmMain {
+		t.Errorf("model = %q, want %s", got, glmMain)
+	}
+	assertRecord(t, pctx, pipeline.ActionModify, "resent",
+		map[string]string{"server": "glm", "model": "exo-free", "substitute": glmMain})
+}
+
+// A substitute the server refuses too ends there, whether it was resent or chosen up
+// front from a remembered refusal: one resend at most, then the agent sees the answer.
+func TestResend_ARefusedSubstituteEndsThere(t *testing.T) {
+	missing := func(m string) string {
+		return `{"error":{"message":"model '` + m + `' not found","type":"not_found_error","param":null,"code":null}}`
+	}
+	store := newStore(t)
+	_, p := buildRouter(t, wordConfig(`"opencode": "glm"`))
+
+	first := chat(store, "opencode.ai", "/zen/v1/chat/completions", opencodeUA, "s1", "exo-free", true)
+	run(t, p, first)
+	if !resend(p, first, http.StatusNotFound, missing("exo-free")) {
+		t.Fatal("Resend = false for the agent's model refused")
+	}
+	if resend(p, first, http.StatusNotFound, missing(glmMain)) {
+		t.Error("Resend = true for a refused substitute: a second resend of one request")
+	}
+	if got := sentModel(t, first); got != glmMain {
+		t.Errorf("model = %q, want the substitute left as sent", got)
+	}
+
+	next := chat(store, "opencode.ai", "/zen/v1/chat/completions", opencodeUA, "s2", "exo-free", true)
+	run(t, p, next)
+	if got := sentModel(t, next); got != glmMain {
+		t.Fatalf("model = %q, want the substitute up front", got)
+	}
+	if resend(p, next, http.StatusNotFound, missing(glmMain)) {
+		t.Error("Resend = true for a substitute chosen up front and refused")
+	}
+}
+
+// A session's kept substitute need not be what the server's list resolves now: the
+// word changed, the list moved, or the model was deleted from the server. Refused, it
+// still reaches the agent, because a request is resent for its model once at most,
+// whatever a second substitute would be.
+func TestResend_AKeptSubstituteRefusedIsNotResentAgain(t *testing.T) {
+	const stale = "rits/zai-org/glm-4-6"
+	r, p := buildRouter(t, wordConfig(`"opencode": "glm"`))
+	pctx := chat(newStore(t), "opencode.ai", "/zen/v1/chat/completions", opencodeUA, "s1", "exo-free", true)
+	r.keepSubstitute(pctx, "glm", "exo-free", stale)
+	run(t, p, pctx)
+	if got := sentModel(t, pctx); got != stale {
+		t.Fatalf("model = %q, want the session's kept substitute %s", got, stale)
+	}
+	if resend(p, pctx, http.StatusNotFound, `{"error":{"message":"model '`+stale+`' not found","type":"not_found_error","param":null,"code":null}}`) {
+		t.Error("Resend = true for a kept substitute the server refused: a second model for one request")
+	}
+}
+
+// A local server's refusal is answered from that server's own list, found by the host and
+// port the request was sent to.
+func TestResend_ALocalServersRefusalIsAnsweredFromItsOwnList(t *testing.T) {
+	r := New()
+	if err := r.Configure(json.RawMessage(localServers)); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	r.catalogs.set("ollama", []string{"granite3.3:8b"})
+	r.catalogs.set("vllm", []string{"qwen2.5-0.5b"})
+	p, err := pipeline.New([]pipeline.Plugin{r})
+	if err != nil {
+		t.Fatalf("pipeline.New: %v", err)
+	}
+	pctx := claudeCode(request(newStore(t), "api.anthropic.com", claudeUA, "s1"), pipeline.AgentRoleMain, 26, 0)
+	pctx.Body = []byte(`{"model":"claude-opus-5-5","messages":[{"role":"user","content":"hello"}]}`)
+	run(t, p, pctx)
+	assertRouted(t, pctx, "localhost:11434", "ollama-key")
+	if !resend(p, pctx, http.StatusNotFound, `{"type":"error","error":{"type":"not_found_error","message":"model 'claude-opus-5-5' not found"}}`) {
+		t.Fatal("Resend = false for ollama's refusal")
+	}
+	if got := sentModel(t, pctx); got != "granite3.3:8b" {
+		t.Errorf("model = %q, want ollama's granite3.3:8b", got)
+	}
+}

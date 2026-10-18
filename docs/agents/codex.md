@@ -135,18 +135,24 @@ how the `CODEX_CA_CERTIFICATE` mistake survived its first review.
 
 ## What Cortex shows for it
 
-**Its own agent.** Codex sends two product tokens, both folded to the canonical agent name
+**Its own agent.** Codex sends four product tokens, all folded to the canonical agent name
 `codex`, so its traffic gets its own row in agentop's agents pane instead of sharing
 `Other`:
 
 | User-Agent | Sent on |
 |---|---|
-| `codex_exec/<version> (<os>; <arch>) unknown` — sometimes with a trailing `(codex_exec; <version>)` comment | its inference (`/backend-api/codex/responses`) and most other backend calls |
+| `codex_exec/<version> (<os>; <arch>) <term>` — sometimes with a trailing `(codex_exec; <version>)` comment | its inference (`/backend-api/codex/responses`) and most other backend calls |
 | `codex-mcp-client/<version>` | its MCP client (`/backend-api/ps/mcp`) |
-| `codex-tui/<version> (<os>; <arch>) unknown` | the interactive TUI — i.e. plain `codex` |
-| `codex_cli_rs/<version> (<os>; <arch>) unknown` | anything sent before its app-server finishes initializing |
+| `codex-tui/<version> (<os>; <arch>) <term>` — sometimes with a trailing `(codex-tui; <version>)` comment | the interactive TUI — i.e. plain `codex` — including its inference |
+| `codex_cli_rs/<version> (<os>; <arch>) <term>` | anything sent before its app-server finishes initializing |
 
-The version is the field after the first slash in both. The MCP client folds to the same
+`<term>` is the `TERM` environment variable — the terminal type. It reads `unknown` under
+`codex exec`, which runs without a TTY, and the terminal's own name under the interactive
+TUI (`xterm-256color` on the captures these rows come from). Nothing reads this field:
+Cortex matches on the product token before the first slash, which is why a varying `TERM`
+does not split one agent into several rows.
+
+The version is the field after the first slash in all four. The MCP client folds to the same
 name deliberately: it is one agent's component, not a second agent. **Codex's telemetry
 exporter is not claimed** — it sends `OTel-OTLP-Exporter-Rust/<version>` to
 `ab.chatgpt.com`, which names a generic Rust crate rather than Codex, so it stays
@@ -196,16 +202,30 @@ mislabelled `Content-Type: application/json`. Codex's tool calls arrive as
 is one — so a consumer that parses `ToolCalls[].Arguments` as JSON must tolerate failure
 for this dialect.
 
-**Tokens always; cost only if you configure a rate.** Token counts come from the Responses
+**Tokens always; cost on a laptop once the price list downloads, or wherever you
+configure a rate.** Token counts come from the Responses
 API's usage block and aggregate alongside other agents (verified: a one-turn `codex exec`
-reported 13,260 tokens under the `codex` series of `GET /v1/usage?group=agent`). **Cost is
-blank out of the box**, and the reason is not Codex-specific: the bundled rate table is
-**Anthropic-only by design**, so any agent on a non-Anthropic model reports its requests
-as *priceable but unpriced* — named, never under-priced. See
+reported 13,260 tokens under the `codex` series of `GET /v1/usage?group=agent`).
+
+**Cost on a laptop install: usually yes, and from a download rather than from the
+binary.** The bundled table carries first-party OpenAI list rates, so a GPT model prices
+the same way a Claude one does — but the *shipped* table is pinned to a LiteLLM commit,
+and a model added upstream after that commit is not in it. `gpt-6-luna` is one such, so
+the compiled-in table alone does not price it. What closes the gap is the price-list
+download: a local install fetches LiteLLM `main` at startup and hourly through the same
+filter that generated the table, keeps it in `~/.cortex/price-list.json`, and today's
+upstream prices `gpt-6-luna` at $0.10 in / $0.50 out per million. So cost appears without
+configuring anything, once that first download lands.
+
+**On a sidecar in a cluster, no.** Sidecars make no such call and keep the compiled-in
+table, so a model newer than the pin reports *priceable but unpriced* there — named,
+never under-priced. See
 [Finding traffic that is not priced](../pricing.md#finding-traffic-that-is-not-priced).
 
-A rate does exist upstream if you want one. These are the first-party OpenAI list prices
-for the model Codex uses, from the same LiteLLM table the bundled one is generated from:
+Pin the rate yourself when you want it independent of a download — in a sidecar, with
+`bundled: false`, or to assert a figure rather than inherit one. These are the first-party
+OpenAI list prices for the model Codex uses, and a configured entry outranks both the
+shipped table and the download:
 
 ```yaml
 # ~/.cortex/config.yaml
@@ -263,26 +283,37 @@ with Cortex built from the change that added this page. This was exercised:
   judged on the bridge terminating rather than on Codex replying (see CA trust);
 - **each of the four proxy-variable spellings alone**, with the other three absent: all
   four independently routed Codex's traffic, which is why `enable` writes all four;
-- agent recognition for all three User-Agents above, including the telemetry exporter
-  staying unrecognised;
+- agent recognition for every User-Agent above, including the TUI's — captured from a
+  real interactive session driven through the proxy over a pty, not inferred from
+  Codex's source — and including the telemetry exporter staying unrecognised;
 - the `codex` series in `GET /v1/usage?group=agent`, and the model showing as priceable
   but unpriced.
 
 Not tested:
 
-- **Linux, and any other Codex version.** Every string here was captured from 0.160.1 on
-  macOS; the User-Agent shapes and the `.env` behaviour are pinned to that.
+- **Linux.** Everything here was exercised on macOS only.
+- **Codex versions other than 0.160.1 and 0.162.1.** Both appeared in one capture (an
+  auto-update landed mid-session) and both parse identically, which is some evidence the
+  User-Agent shape is stable across releases rather than pinned to one build — but the
+  `.env` loading behaviour and the `CODEX_` filter were only read from 0.160.1's source.
 - **The public `/v1/responses` API** (an OpenAI API key rather than a ChatGPT
   subscription). The parser recognises the path, and the non-streaming shape of that
   dialect is modelled from the published schema rather than from captured traffic.
 - **A `function_call` tool call.** Codex's own `exec` tool is a `custom_tool_call`; the
   `function_call` shape is modelled from the documented schema.
-- **Cost**, since no rate applies to the model — the pricing path is unexercised for Codex.
+- **Cost from a downloaded rate, against live Codex traffic.** The rate exists upstream and
+  the bundled table now carries first-party OpenAI prices, so the arithmetic is the same one
+  every other agent uses — but nobody has watched a real `codex exec` turn get priced from
+  `~/.cortex/price-list.json`. A configured `pricing:` entry is the exercised path.
 - **Tool pruning**, which is unsupported above rather than merely untested.
 
 ## Known issues
 
-- **Cost is blank.** Tokens aggregate; cost does not, for want of a rate — see
+- **Cost is blank where no list price reaches the model.** Two cases, and neither is
+  Codex-specific: a **sidecar** keeps the compiled-in table and makes no download, so a
+  model newer than the pinned commit has no rate there; and `bundled: false` turns the
+  shipped table *and* the download off together. On a laptop with defaults the rate arrives
+  with the first hourly fetch. See
   [What Cortex shows for it](#what-cortex-shows-for-it).
 - **Chatty non-inference traffic.** A single one-turn `codex exec` produced ~100 recorded
   events, most of them not inference: repeated polling of

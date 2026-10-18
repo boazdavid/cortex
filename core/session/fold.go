@@ -331,8 +331,21 @@ func (f *SummaryFold) UnmarshalJSON(b []byte) error {
 	if j.TitleRank != nil {
 		f.titleRank = *j.TitleRank
 	}
+	// THE PERSISTED NAMES ARE FOLDED TO THEIR CANONICAL SPELLING HERE, at the one place a
+	// session.json's labels re-enter memory, because every reader of a restored fold reads
+	// f.agents: Summary and withPriorLocked's agentOfLocked serve it as the session's agent,
+	// Add's dedup keys on the name, and a re-Marshal persists what this leaves. A document
+	// written before an agent-name rename holds the spelling of its day ("bob-shell",
+	// "ibm-bob"), and restoring it verbatim would serve the retired spelling beside today's
+	// row — the exact split the rename's fold exists to prevent. Idempotent for everything
+	// else: applyAgent computed each label through AgentName when it was written, and
+	// CanonicalAgent is the identity on every current name.
 	for _, a := range j.Agents {
-		f.agents = append(f.agents, sessionAgent{name: a.Name, label: a.Label, known: !a.Unknown})
+		f.agents = append(f.agents, sessionAgent{
+			name:  pipeline.CanonicalAgent(a.Name),
+			label: pipeline.AgentName(a.Label),
+			known: !a.Unknown,
+		})
 	}
 	return nil
 }

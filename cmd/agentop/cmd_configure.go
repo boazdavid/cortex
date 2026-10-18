@@ -15,14 +15,13 @@ Usage:
   agentop configure bob enable  [--yes] [--settings PATH] [--config PATH]
   agentop configure bob disable [--yes] [--settings PATH] [--config PATH]
   agentop configure bob status  [--settings PATH] [--config PATH]
-  agentop configure bobshell enable | disable | status
   agentop configure opencode enable | disable [--yes] [--config PATH] [--opencode BIN]
   agentop configure opencode status [--config PATH] [--opencode BIN]
   agentop configure codex enable  [--yes] [--env PATH] [--config PATH]
   agentop configure codex disable [--yes] [--env PATH]
   agentop configure codex status  [--env PATH] [--config PATH]
 
-"agentop configure status" — with no agent name — answers the question the five
+"agentop configure status" — with no agent name — answers the question the four
 per-agent "status" verbs answer one at a time: which harnesses on this machine are
 wired into Cortex. One row per agent, one verdict each, with the detail that verdict
 rests on. There are four verdicts rather than a yes and a no, because a boolean would
@@ -39,13 +38,11 @@ Agents:
   claude-code    writes the proxy and CA variables into ~/.claude/settings.json, so
                  every session on the machine goes through Cortex. Run
                  "agentop configure claude-code --help" for the detail.
-  bob            writes "http.proxy" into IBM Bob's settings.json, so the Bob
-                 editor itself goes through Cortex. Run
-                 "agentop configure bob --help" for the detail.
-  bobshell       defines a "bob" shell function in your shell's rc file, so typing
-                 "bob" runs it through Cortex. A different thing from "bob" above,
-                 and the two are independent. Run
-                 "agentop configure bobshell --help" for the detail.
+  bob            configures both faces of one agent: writes "http.proxy" into
+                 IBM Bob's settings.json so the editor goes through Cortex, and
+                 defines a "bob" shell function in your shell's rc file so typing
+                 "bob" runs it through Cortex. Run "agentop configure bob --help"
+                 for the detail.
   opencode       sets the proxy and CA variables in OpenCode's background-service
                  environment, which sends all of OpenCode's traffic. Run
                  "agentop configure opencode --help" for the detail.
@@ -58,13 +55,15 @@ whatever X is, and the answer used to be spelled differently per agent: a top-le
 "agentop claude-code" for the one agent with a settings file, and nothing at all for
 the ones without.
 
-Five agents persist, by four different mechanisms. Claude Code and Bob read settings
-files, so their configuration goes there — the key differs (Claude Code keeps an "env"
-block, Bob is a VS Code fork and reads "http.proxy"), and Bob additionally needs the
-bridge CA trusted by the OS, which "configure bob enable" prints rather than performs.
-Bob Shell gets a shell function written into the rc file instead, so the routing is
-applied when you type the command. OpenCode's background service keeps an environment
-of its own, so its configuration goes there, through the opencode CLI. Codex has no
+Four agents persist, by four different mechanisms. Claude Code reads a settings
+file, so its configuration goes there — it keeps an "env" block. Bob is two faces of
+one agent and persists twice: the editor is a VS Code fork and reads "http.proxy"
+from its settings.json, and on macOS enable also arranges the bridge-CA trust itself
+(a settings key plus a launch-environment block in the rc file; off macOS it prints
+the OS trust step rather than performing it), while the shell function is written
+into the rc file, so the routing is applied when you type the command.
+OpenCode's background service keeps an environment of its own, so its configuration
+goes there, through the opencode CLI. Codex has no
 settings file and no background service, but loads a dotenv file, ~/.codex/.env, on
 its own at startup — confirmed against the real Codex CLI — so its configuration goes
 there, scanning the whole file for an existing definition of each key rather than only
@@ -117,22 +116,18 @@ func runConfigure(args []string, stdout, stderr io.Writer) int {
 		// type something else.
 		return runClaudeCode(args[1:], stdout, stderr)
 	case "bob":
-		// Two distinct agents, both spelled with "bob", because there are two
-		// separate things to configure and they persist differently:
-		//
-		//	bob       IBM Bob the editor. A VS Code fork, so it has a settings.json
-		//	          and reads "http.proxy" from it.
-		//	bobshell  the shell integration — a "bob" function in the rc file, so
-		//	          typing "bob" at a prompt runs through Cortex.
+		// One agent, two faces, one command: runBob configures the IBM Bob editor
+		// (a VS Code fork with a settings.json that reads "http.proxy") and the
+		// "bob" shell function (an rc-file block) both.
 		//
 		// This arm reverses part of #1133, which removed "configure bob" reasoning
 		// that "IBM Bob itself needs no configuring". That was right about the
 		// binary and wrong about the editor: Bob has a settings file, and without
 		// this a Bob user had to find "http.proxy" and the CA trust step by hand.
-		// Configuring one does not configure the other; keep both.
+		// Until 2026-10-15 the shell function was a second subcommand, "bobshell";
+		// it folded into this one when the agent converged on a single name, the
+		// way its traffic had already converged in agentop's rows.
 		return runBob(args[1:], stdout, stderr)
-	case "bobshell":
-		return runBobShell(args[1:], stdout, stderr)
 	case "codex":
 		// Codex has no settings file and no background service, but loads a
 		// dotenv file of its own at startup: see cmd_codex.go.
@@ -145,7 +140,7 @@ func runConfigure(args []string, stdout, stderr io.Writer) int {
 		// The named list is the answer to a typo; the usage block after it is the
 		// answer to "what else can this do", which is what someone who guessed an
 		// agent name wrong most likely wanted. Same pairing as the no-argument case.
-		fmt.Fprintf(stderr, "agentop: unknown agent %q (claude-code, bob, bobshell, codex, opencode)\n", agent)
+		fmt.Fprintf(stderr, "agentop: unknown agent %q (claude-code, bob, codex, opencode)\n", agent)
 		fmt.Fprint(stderr, configureUsage)
 		return 2
 	}

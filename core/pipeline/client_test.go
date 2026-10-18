@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"fmt"
+	"maps"
 	"net/http"
 	"strings"
 	"testing"
@@ -89,8 +90,8 @@ func TestParseUserAgent_BobShellIsIdentifiedByItsTrailingProductToken(t *testing
 			if got == nil {
 				t.Fatalf("ParseUserAgent(%q) = nil, want a client", tc.ua)
 			}
-			if got.Name != "bob-shell" {
-				t.Errorf("Name = %q, want %q", got.Name, "bob-shell")
+			if got.Name != "bob" {
+				t.Errorf("Name = %q, want %q", got.Name, "bob")
 			}
 			if got.Version != "2.0.5" {
 				t.Errorf("Version = %q, want %q", got.Version, "2.0.5")
@@ -98,7 +99,7 @@ func TestParseUserAgent_BobShellIsIdentifiedByItsTrailingProductToken(t *testing
 			// Label is the assertion that matters downstream: it is what the usage
 			// aggregator keys its series on and what ledger.Row.Agent stores, so this is
 			// the field that decides whether three User-Agents are one row or three.
-			if want := "bob-shell/2.0.5"; got.Label() != want {
+			if want := "bob/2.0.5"; got.Label() != want {
 				t.Errorf("Label() = %q, want %q — this is the series key, so a mismatch here IS the fragmentation", got.Label(), want)
 			}
 		})
@@ -121,7 +122,7 @@ func TestParseUserAgent_AKnownFirstTokenIsNotReResolvedByALaterToken(t *testing.
 		name, ua, wantName, wantVer string
 	}{
 		{"claude first, bob last", "claude-cli/2.1.270 bob-shell/2.0.5", "claude-code", "2.1.270"},
-		{"bob first, claude last", "bob-shell/2.0.5 claude-cli/2.1.270", "bob-shell", "2.0.5"},
+		{"bob first, claude last", "bob-shell/2.0.5 claude-cli/2.1.270", "bob", "2.0.5"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := ParseUserAgent(tc.ua)
@@ -157,8 +158,8 @@ func TestParseUserAgent_TheTrailingScanReadsLastToFirst(t *testing.T) {
 	if got == nil {
 		t.Fatalf("ParseUserAgent(%q) = nil, want a client", ua)
 	}
-	if got.Name != "bob-shell" {
-		t.Errorf("Name = %q, want %q — the scan must read backwards, so the LAST known token wins once the first token is unknown", got.Name, "bob-shell")
+	if got.Name != "bob" {
+		t.Errorf("Name = %q, want %q — the scan must read backwards, so the LAST known token wins once the first token is unknown", got.Name, "bob")
 	}
 	if got.Version != "2.0.5" {
 		t.Errorf("Version = %q, want %q — the version must come from the token that matched", got.Version, "2.0.5")
@@ -186,13 +187,13 @@ func TestParseUserAgent_IBMBobIDEIsOneAgent(t *testing.T) {
 			if got == nil {
 				t.Fatalf("ParseUserAgent(%q) = nil, want a client", tc.ua)
 			}
-			if got.Name != "ibm-bob" || got.Version != "2.2.1" {
-				t.Errorf("Name, Version = %q, %q, want %q, %q", got.Name, got.Version, "ibm-bob", "2.2.1")
+			if got.Name != "bob" || got.Version != "2.2.1" {
+				t.Errorf("Name, Version = %q, %q, want %q, %q", got.Name, got.Version, "bob", "2.2.1")
 			}
-			if got.AffinityName() != "ibm-bob" {
-				t.Errorf("AffinityName() = %q, want ibm-bob — without it the session is no agent's", got.AffinityName())
+			if got.AffinityName() != "bob" {
+				t.Errorf("AffinityName() = %q, want bob — without it the session is no agent's", got.AffinityName())
 			}
-			if want := "ibm-bob"; AgentName(got.Label()) != want {
+			if want := "bob"; AgentName(got.Label()) != want {
 				t.Errorf("AgentName(Label()) = %q, want %q — this is the AGENTS row", AgentName(got.Label()), want)
 			}
 		})
@@ -227,8 +228,18 @@ func TestParseUserAgent_Codex(t *testing.T) {
 		// The interactive TUI, and the default originator for anything Codex sends
 		// before its app-server initialize completes. Both are what `configure codex
 		// enable` actually sends people to, so both must fold to the same row as exec.
-		{"codex-tui/0.160.1 (Mac OS 26.3.0; arm64) unknown", "codex", "0.160.1"},
-		{"codex_cli_rs/0.160.1 (Mac OS 26.3.0; arm64) unknown", "codex", "0.160.1"},
+		// Captured from a real TUI session driven through the proxy over a pty — the
+		// TUI's own inference requests to /backend-api/codex/responses carry the first
+		// of these. Note the third field is the TERM value, "unknown" under `codex
+		// exec` and the terminal's name here, which is why the parse must key on the
+		// product token alone.
+		{"codex-tui/0.160.1 (Mac OS 26.3.0; arm64) xterm-256color (codex-tui; 0.160.1)", "codex", "0.160.1"},
+		{"codex_cli_rs/0.160.1 (Mac OS 26.3.0; arm64) xterm-256color", "codex", "0.160.1"},
+		// The same capture also carried 0.162.1, mid-auto-update, which is the only
+		// evidence in this suite that the UA SHAPE is stable across Codex releases
+		// rather than pinned to the one build everything else here was read from.
+		{"codex-tui/0.162.1 (Mac OS 26.3.0; arm64) xterm-256color (codex-tui; 0.162.1)", "codex", "0.162.1"},
+		{"codex_cli_rs/0.162.1 (Mac OS 26.3.0; arm64) xterm-256color", "codex", "0.162.1"},
 		// Originator names the same binary carries but that nothing has tied to live
 		// Codex traffic. Deliberately unclaimed; see knownClients.
 		{"codex_vscode/0.160.1", "", ""},
@@ -343,13 +354,16 @@ func TestIsKnownAgent(t *testing.T) {
 		want bool
 	}{
 		{"claude-code", true},
-		{"bob-shell", true},
-		{"ibm-bob", true},
+		{"bob", true},
 		{"opencode", true},
 		{"codex", true},
 		// A product token is not a canonical name: claude-cli is how Claude Code is RECOGNISED.
 		{"claude-cli", false},
-		{"bob", false},
+		// Retired spellings are not canonical names either — but AgentName folds them to
+		// one before any consumer asks, so IsKnownAgent(AgentName(label)) stays true for
+		// a label recorded under the old name. Pinned by TestAgentName below.
+		{"bob-shell", false},
+		{"ibm-bob", false},
 		{"codex_exec", false},
 		{"codex-mcp-client", false},
 		// Versioned labels have to be folded first; the godoc says so.
@@ -821,8 +835,8 @@ func TestAffinityName(t *testing.T) {
 	}{
 		{"claude-cli/2.1.284 (external, cli)", "claude-code"},
 		{"Claude-User (claude-code/2.1.284; +https://support.anthropic.com/)", "claude-code"},
-		{"ai-sdk/5.0.1 openai-compatible/3.0.36 bob-shell/2.0.5", "bob-shell"},
-		{"bob-shell/2.0.5", "bob-shell"},
+		{"ai-sdk/5.0.1 openai-compatible/3.0.36 bob-shell/2.0.5", "bob"},
+		{"bob-shell/2.0.5", "bob"},
 		{"Go-http-client/1.1", ""},
 		{"python-httpx/0.27.0", ""},
 		{"axios/1.15.2", ""},
@@ -859,8 +873,14 @@ func TestAffinityName_LeavesTheLabelAlone(t *testing.T) {
 func TestAgentName(t *testing.T) {
 	cases := []struct{ label, want string }{
 		{"claude-code/2.1.285", "claude-code"},
-		{"bob-shell/2.0.5", "bob-shell"},
+		{"bob-shell/2.0.5", "bob"},
 		{"claude-code", "claude-code"},
+		// Retired spellings fold to their replacement, versioned or bare, so a label
+		// recorded before a rename joins the row its agent writes today. This is the
+		// fold that keeps a rename from splitting one agent's history in two.
+		{"ibm-bob/2.2.1", "bob"},
+		{"bob-shell", "bob"},
+		{"ibm-bob", "bob"},
 		{"curl/8.4.0", "curl"},
 		{UnknownClientLabel, UnknownClientLabel},
 		{"Claude-User (claude-code/2.1.284; +https://support.anthropic.com/)",
@@ -876,5 +896,32 @@ func TestAgentName(t *testing.T) {
 		if got := AgentName(tc.label); got != tc.want {
 			t.Errorf("AgentName(%q) = %q, want %q", tc.label, got, tc.want)
 		}
+	}
+}
+
+// FoldAgentNames is the one map-level fold both the router and agentop key their
+// views of an agents: config with, so its collision rule is worth pinning directly:
+// a config naming both a retired spelling and its replacement resolves to ONE key,
+// deterministically, whichever way the map iterates.
+func TestFoldAgentNames(t *testing.T) {
+	folded := FoldAgentNames(map[string]string{
+		"bob-shell":   "glm",
+		"ibm-bob":     "ete",
+		"claude-code": "glm",
+		"opencode":    "ete",
+	})
+	want := map[string]string{"bob": "glm", "claude-code": "glm", "opencode": "ete"}
+	if !maps.Equal(folded, want) {
+		t.Errorf("FoldAgentNames = %v, want %v", folded, want)
+	}
+	// Both of Bob's retired spellings fold to the one key; the value is whichever
+	// spelling sorts first ("bob-shell" before "ibm-bob"), the same rule the router
+	// applied before the fold was extracted.
+	if got := FoldAgentNames(map[string]string{"ibm-bob": "ete", "bob-shell": "glm"}); !maps.Equal(got, map[string]string{"bob": "glm"}) {
+		t.Errorf("collision = %v, want the sorted-first spelling's server", got)
+	}
+	// An empty or nil map folds to an empty one, so a reset can empty the map.
+	if got := FoldAgentNames(nil); len(got) != 0 {
+		t.Errorf("FoldAgentNames(nil) = %v, want empty", got)
 	}
 }

@@ -296,3 +296,41 @@ func TestFetchModels(t *testing.T) {
 		t.Errorf("closed server: err = %v, want no URL, path or key in it", err)
 	}
 }
+
+// A loopback host is one machine serving many things, so there a server is its host and
+// port; anywhere else the port is ignored, as before. A port the scheme defaults is no
+// port on either side.
+func TestKey(t *testing.T) {
+	for hostport, want := range map[string]string{
+		"localhost:11434":      "localhost:11434",
+		"LOCALHOST:11434":      "localhost:11434",
+		"127.0.0.1:8000":       "127.0.0.1:8000",
+		"[::1]:8080":           "[::1]:8080",
+		"localhost":            "localhost",
+		"localhost:80":         "localhost",
+		"localhost:443":        "localhost",
+		"glm.example.com:8443": "glm.example.com",
+		"GW.example":           "gw.example",
+	} {
+		if got := Key(hostport); got != want {
+			t.Errorf("Key(%q) = %q, want %q", hostport, got, want)
+		}
+	}
+}
+
+// Two model servers on one machine are two servers; one address named twice is still
+// refused.
+func TestDecode_LocalServersAreTheirPorts(t *testing.T) {
+	if _, err := Decode(json.RawMessage(`{"servers": {
+		"ollama": {"url": "http://localhost:11434", "key": "k", "main": "m", "helper": "h"},
+		"vllm":   {"url": "http://localhost:8000", "key": "k", "main": "m", "helper": "h"},
+		"llama":  {"url": "http://127.0.0.1:8080", "key": "k", "main": "m", "helper": "h"}}}`)); err != nil {
+		t.Errorf("Decode refused three local servers on their own ports: %v", err)
+	}
+	_, err := Decode(json.RawMessage(`{"servers": {
+		"a": {"url": "http://localhost:11434", "key": "k", "main": "m", "helper": "h"},
+		"b": {"url": "http://LOCALHOST:11434", "key": "k", "main": "m", "helper": "h"}}}`))
+	if err == nil || !strings.Contains(err.Error(), `"a" and "b" are both on localhost:11434`) {
+		t.Errorf("err = %v, want the two servers on localhost:11434 refused", err)
+	}
+}

@@ -48,8 +48,11 @@ func TestListSessions_NamesTheSessionsAgent(t *testing.T) {
 	s.Claim("task-1", "bob-shell")
 	s.Append("task-1", evFrom(claude))
 	s.Append("task-1", evFrom(bob))
-	if got := agentOf(t, s, "task-1"); got != "bob-shell" {
-		t.Errorf("task-1 agent = %q, want bob-shell (the owner that claimed it)", got)
+	// The claim and the events both carry the pre-convergence spelling "bob-shell";
+	// the read folds it to "bob", so a session claimed under the old name still
+	// names its agent under the new one.
+	if got := agentOf(t, s, "task-1"); got != "bob" {
+		t.Errorf("task-1 agent = %q, want bob (the owner that claimed it)", got)
 	}
 	s.Claim("task-2", "bob-shell")
 	s.Append("task-2", evFrom(claude))
@@ -84,8 +87,8 @@ func TestListSessions_NamesTheIBMBobIDE(t *testing.T) {
 	} {
 		s.Append("3981fd731b31c9d1aff4e17e6556f5c6", evFrom(pipeline.ParseUserAgent(ua)))
 	}
-	if got := agentOf(t, s, "3981fd731b31c9d1aff4e17e6556f5c6"); got != "ibm-bob" {
-		t.Errorf("agent = %q, want ibm-bob", got)
+	if got := agentOf(t, s, "3981fd731b31c9d1aff4e17e6556f5c6"); got != "bob" {
+		t.Errorf("agent = %q, want bob", got)
 	}
 }
 
@@ -205,7 +208,7 @@ func TestListSessions_NamesAnUnrecognisedAgent(t *testing.T) {
 		name:    "a recognised agent inside a comment is still recognised",
 		id:      "sdk-1",
 		clients: []*pipeline.EventClient{bobSDK},
-		want:    "ibm-bob",
+		want:    "bob",
 		// AffinityName is WIDER than Name: it scans later tokens, so this one is recognised and
 		// takes the recognised pass. The case is here to pin that the new unrecognised pass did
 		// not swallow it — keyed by label, it would have reported the whole SDK string.

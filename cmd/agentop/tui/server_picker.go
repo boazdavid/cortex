@@ -177,7 +177,7 @@ func (m *model) applyServerChoice() tea.Cmd {
 		res, err := edit.WritePluginConfig(context.Background(), edit.ConfigWrite{
 			Path:     path,
 			StatsURL: statsURL,
-			Changes:  []edit.ConfigChange{servers.AgentChange(agent, server)},
+			Changes:  servers.AgentChanges(agent, server),
 			Verify:   servers.Verify,
 		})
 		return serverSwitchedMsg{agent: agent, server: server, statsURL: statsURL, staying: staying, inForce: inForce,
@@ -372,9 +372,9 @@ func (m *model) serverNoticeKey(msg tea.KeyMsg) tea.Cmd {
 }
 
 // closeServerPanels drops S's picker and its panel. Called wherever the AGENTS pane is entered
-// and where the connection is left: either is drawn only over that pane, but a message can move
-// the pane out from under one (a clear landing sets Sessions), and the next visit must not find a
-// picker for a value in force that may since have changed.
+// and where the connection is left: either is drawn only over that pane, but the pane can move out
+// from under one, and the next visit must not find a picker for a value in force that may since
+// have changed.
 func (m *model) closeServerPanels() {
 	m.serverPicker = nil
 	m.serverNotice = ""

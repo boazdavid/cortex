@@ -15,8 +15,8 @@ import (
 // $CODEX_HOME/.env (default ~/.codex/.env) — confirmed on the real Codex CLI to be
 // loaded on its own at process start, not something agentop sources into a shell (see
 // codexUsage). Codex has no settings JSON and no background service, so this is a
-// fourth persistence mechanism alongside claude-code's settings file, bobshell's rc
-// function and opencode's service environment.
+// fourth persistence mechanism alongside claude-code's settings file, bob's rc-file
+// shell function and opencode's service environment.
 
 const (
 	// codexEnvRel is Codex's own dotenv file, read by Codex itself at startup,

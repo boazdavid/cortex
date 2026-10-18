@@ -182,8 +182,22 @@ func runSupervisor(flagName string) error {
 	stopping := make(chan os.Signal, 1)
 	signal.Notify(stopping, syscall.SIGTERM, syscall.SIGINT)
 
+	// The fallback holds the forward address whenever no child does, so a routed agent
+	// gets a 502 that names Cortex instead of a refused connection it cannot trace. It
+	// is opened here because nothing is serving yet, and closed before every start. See
+	// fallback.go. It deliberately does not cover `agentop service stop`: that stops
+	// this supervisor too, and that path already warns, having been asked for.
+	fallback := &fallbackServer{}
+	fallbackAddr := supervisorForwardAddr(args)
+	fallback.open(fallbackAddr)
+	defer fallback.close()
+
 	policy := &restartPolicy{delay: superviseRestartDelay}
 	for {
+		// Hand the address to the child. Nothing else frees it, so this is what lets the
+		// child bind at all.
+		fallback.close()
+
 		cmd := exec.Command(self, args...) //nolint:gosec // our own binary, filtered args
 		cmd.Stdout, cmd.Stderr, cmd.Stdin = os.Stdout, os.Stderr, nil
 		start := time.Now()
@@ -232,6 +246,9 @@ func runSupervisor(flagName string) error {
 				break wait
 			}
 		}
+
+		// The child is gone, so the address is free and nothing would answer on it.
+		fallback.open(fallbackAddr)
 
 		note := policy.exited(portInUseExit(werr), wasHealthy)
 		if note.explain {

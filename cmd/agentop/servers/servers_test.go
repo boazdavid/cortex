@@ -80,13 +80,29 @@ func TestForHost(t *testing.T) {
 }
 
 func TestAgentChange(t *testing.T) {
-	set := AgentChange("claude-code", "glm")
-	if set.Chain != "outbound" || set.Plugin != PluginName || strings.Join(set.Path, ".") != "agents.claude-code" ||
-		set.Value == nil || set.Value.Value != "glm" || set.CreatePlugin {
-		t.Errorf("AgentChange(claude-code, glm) = %+v", set)
+	// PER-KEY, one change per spelling: a removal for every way the config might
+	// name the agent, then the one set of the canonical key. A whole-map
+	// replacement would depend on a snapshot of agents: — and revert a concurrent
+	// write for another agent — so the changes touch nothing but this agent.
+	set := AgentChanges("bob", "glm")
+	if len(set) != 3 {
+		t.Fatalf("AgentChanges(bob, glm) = %d changes, want 3 (two removals, one set): %+v", len(set), set)
 	}
-	if reset := AgentChange("claude-code", ""); reset.Value != nil {
-		t.Errorf("AgentChange(claude-code, \"\") sets %v; want a removal", reset.Value)
+	for i, want := range []string{"bob-shell", "ibm-bob"} {
+		if got := set[i]; got.Value != nil || strings.Join(got.Path, ".") != "agents."+want ||
+			got.Chain != "outbound" || got.Plugin != PluginName || got.CreatePlugin {
+			t.Errorf("removal %d = %+v, want agents.%s removed", i, got, want)
+		}
+	}
+	if got := set[2]; strings.Join(got.Path, ".") != "agents.bob" || got.Value == nil || got.Value.Value != "glm" {
+		t.Errorf("set = %+v, want agents.bob = glm", got)
+	}
+	// Stopping the routing removes the canonical spelling too, and only that: no
+	// set, and nothing touching any other agent's keys.
+	for _, got := range AgentChanges("claude-code", "") {
+		if strings.Join(got.Path, ".") != "agents.claude-code" || got.Value != nil {
+			t.Errorf("reset change = %+v, want only agents.claude-code removed", got)
+		}
 	}
 }
 
@@ -124,6 +140,26 @@ func TestInactive(t *testing.T) {
 		fix := "Remove on_error from the entry in " + file + ", or set it to enforce, to route."
 		if got := Inactive(policy, file); got != want+fix {
 			t.Errorf("Inactive(%q) =\n %q\nwant\n %q", policy, got, want+fix)
+		}
+	}
+}
+
+// On a loopback host a server is its host and port, as the plugin matches a request
+// there: a session sent to another port on the same machine is on no server.
+func TestForHost_LocalServersByPort(t *testing.T) {
+	local := routerconfig.Config{Servers: map[string]routerconfig.Server{
+		"ollama": {URL: "http://localhost:11434", Key: "k", Main: "g", Helper: "g"},
+		"vllm":   {URL: "http://localhost:8000", Key: "k", Main: "q", Helper: "q"},
+	}}
+	for host, want := range map[string]string{
+		"localhost:11434": "ollama",
+		"localhost:8000":  "vllm",
+		"localhost:3000":  "",
+		"localhost":       "",
+	} {
+		got, ok := ForHost(local, host)
+		if got != want || ok != (want != "") {
+			t.Errorf("ForHost(%q) = %q, %v; want %q", host, got, ok, want)
 		}
 	}
 }

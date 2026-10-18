@@ -533,8 +533,8 @@ func TestServerPicker_RefusesWhileASwitchIsInFlight(t *testing.T) {
 	}
 }
 
-// A message can move the pane under the picker — a clear landing after its dialog was hidden
-// sets Sessions — and the next visit to the AGENTS pane must not find it there again.
+// A picker left behind when something moves the pane off AGENTS does not come back on the next
+// visit to the AGENTS pane.
 func TestServerPicker_DoesNotComeBackAfterThePaneMovesUnderIt(t *testing.T) {
 	m := serverModel(t, newFakeProxy(t, false))
 	onRow(t, m, "claude-code/2.1.270")
@@ -542,10 +542,7 @@ func TestServerPicker_DoesNotComeBackAfterThePaneMovesUnderIt(t *testing.T) {
 	if m.serverPicker == nil {
 		t.Fatalf("no picker; notice %q", m.serverNotice)
 	}
-	m.Update(clearDoneMsg{res: apiclient.ClearResult{}})
-	if m.pane == paneAgents {
-		t.Fatal("the clear did not move the pane")
-	}
+	m.pane = paneSessions
 	m.enterAgents(paneSessions)
 	if m.serverPicker != nil || strings.Contains(m.View(), "sessions use") {
 		t.Errorf("the picker came back: %+v", m.serverPicker)

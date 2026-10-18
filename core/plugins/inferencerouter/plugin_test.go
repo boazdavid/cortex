@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/rossoctl/cortex/core/memstore"
 	"github.com/rossoctl/cortex/core/pipeline"
@@ -777,6 +778,44 @@ func TestRouter_APinHoldsOnlyForTheAgentItWasMadeFor(t *testing.T) {
 	assertRecord(t, owner, pipeline.ActionModify, "routed", map[string]string{"server": "glm", "pin": pinExisting})
 }
 
+// A config naming an agent by a spelling a rename retired still routes it: Configure
+// folds the `agents:` keys through pipeline.CanonicalAgent, so "bob-shell" and
+// "ibm-bob" — the two names Bob's faces carried before they converged on "bob" —
+// name the agent today's requests report. Without the fold a config written before
+// the rename silently stops matching anything, which is a routing change nobody
+// edited.
+func TestRouter_ARetiredAgentSpellingStillRoutes(t *testing.T) {
+	for _, agent := range []string{"bob-shell", "ibm-bob"} {
+		t.Run(agent, func(t *testing.T) {
+			p := build(t, routerConfig(`"`+agent+`": "glm"`))
+			pctx := request(newStore(t), eteHost, "bob-shell/2.0.5", "s1")
+			run(t, p, pctx)
+
+			assertRouted(t, pctx, glmHost, "glm-key")
+		})
+	}
+}
+
+// A pin stored under a retired agent spelling still holds its session: pin.belongsTo
+// folds the stored spelling, so the convergence rename does not read every existing
+// pin as another agent's and re-decide a running conversation mid-stream — the exact
+// switch the pin exists to prevent.
+func TestRouter_ARetiredPinSpellingStillHolds(t *testing.T) {
+	store := newStore(t)
+	store.Put(pinPrefix+"s1", pin{agent: "bob-shell", server: "glm"}, time.Minute)
+	p := build(t, routerConfig(`"bob": "ete"`))
+
+	pctx := request(store, eteHost, "bob-shell/2.0.5", "s1")
+	run(t, p, pctx)
+
+	// The pin's glm wins over the config's current choice ete.
+	assertRouted(t, pctx, glmHost, "glm-key")
+	assertRecord(t, pctx, pipeline.ActionModify, "routed", map[string]string{"server": "glm", "pin": pinExisting})
+	if pin, _ := pinOf(t, store, "s1"); pin != "glm" {
+		t.Errorf("pin = %q, want glm renewed", pin)
+	}
+}
+
 // claudeCode gives pctx inference-parser's reading of a Claude Code request: role is
 // the caller its system prompt declares, tools how many tools it carries, and turns
 // how many assistant turns came earlier in its conversation.
@@ -948,4 +987,48 @@ func TestRouter_RecordedHistoryOutranksTheRequestsTurn(t *testing.T) {
 	if pin, _ := pinOf(t, store, "running"); pin != "glm" {
 		t.Errorf("pin = %q, want glm", pin)
 	}
+}
+
+// localServers is two model servers on this machine, with claude-code routed to ollama.
+const localServers = `{"servers": {
+	"ollama": {"url": "http://localhost:11434", "key": "ollama-key", "main": "granite", "helper": "granite"},
+	"vllm":   {"url": "http://localhost:8000", "key": "vllm-key", "main": "qwen", "helper": "qwen"}},
+	"agents": {"claude-code": "ollama"}}`
+
+// A server on localhost owns its own port, not the machine: a routed agent's other
+// localhost traffic, such as an MCP server or a dev server, goes where the agent sent it.
+func TestRouter_ALocalServerOwnsOnlyItsPort(t *testing.T) {
+	const ollamaOnly = `{"servers": {
+		"ollama": {"url": "http://localhost:11434", "key": "ollama-key", "main": "granite", "helper": "granite"}},
+		"agents": {"claude-code": "ollama"}}`
+	for _, host := range []string{"localhost:3000", "localhost:5173", "localhost"} {
+		t.Run(host, func(t *testing.T) {
+			p := build(t, ollamaOnly)
+			pctx := request(newStore(t), host, claudeUA, "s1")
+			pctx.Scheme, pctx.Path, pctx.Extensions.Inference = "http", "/mcp", nil
+			run(t, p, pctx)
+			assertUntouched(t, pctx, host)
+			assertRecord(t, pctx, pipeline.ActionSkip, "not_an_inference_server", nil)
+		})
+	}
+	t.Run("its own port", func(t *testing.T) {
+		p := build(t, ollamaOnly)
+		pctx := request(newStore(t), "localhost:11434", claudeUA, "s1")
+		pctx.Scheme, pctx.Path, pctx.Extensions.Inference = "http", "/v1/models", nil
+		run(t, p, pctx)
+		assertRouted(t, pctx, "localhost:11434", "ollama-key")
+	})
+}
+
+// A session's history names its server by the host and port its requests went to, so a
+// conversation that ran on one local server stays there when its agent is routed to
+// another on the same machine.
+func TestRouter_HistoryTellsTwoLocalServersApart(t *testing.T) {
+	h := &fakeHistory{events: map[string][]pipeline.SessionEvent{
+		"running": archived(sent("localhost:8000", claudeUA)),
+	}}
+	p := buildWithHistory(t, localServers, h)
+	pctx := claudeCode(request(newStore(t), "api.anthropic.com", claudeUA, "running"), pipeline.AgentRoleMain, 26, 3)
+	run(t, p, pctx)
+	assertRouted(t, pctx, "localhost:8000", "vllm-key")
 }

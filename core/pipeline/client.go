@@ -1,7 +1,9 @@
 package pipeline
 
 import (
+	"maps"
 	"regexp"
+	"slices"
 	"strings"
 	"unicode/utf8"
 )
@@ -282,21 +284,29 @@ var knownClients = map[string]string{
 	// "Claude-User (claude-code/…)"; see TestParseUserAgent_ClaudeUserIsNotClaimed and
 	// AffinityName's doc comment for why that one stays unrecognised.
 	"claude-code": "claude-code",
-	// bob-shell IS the canonical name here, unlike claude-cli above: the product token Bob
-	// Shell sends is already its product name, so renaming it would invent a third spelling
-	// beside the binary (`bob`) and the IDE ("IBM Bob"). It arrives with its own detection
-	// work — inferenceparser parses its inference endpoint, its session header is
-	// session.BobSessionHeader, and `agentop configure bobshell` sets it up — so this is a
+	// Bob Shell, the CLI — one of the two faces of the agent this repo folds under the
+	// one canonical name "bob" (the other is the entry below). Its product token is
+	// already its product name, but the canonical name is the SHORTER "bob" the binary
+	// answers to, not "bob-shell": two products, one agent, one row in every per-agent
+	// view — the same fold codex-mcp-client makes into "codex". It arrives with its own
+	// detection work — inferenceparser parses its inference endpoint, its session header
+	// is session.BobSessionHeader, and `agentop configure bob` sets it up — so this is a
 	// supported agent rather than the speculative entry the paragraph above refuses.
 	//
-	// Earns its place in the FIRST-token map as well as the trailing scan because Bob sends
-	// the bare form too, on /admin/v1/profile and /inference/v1/model/info, where bob-shell
-	// is the only token there is.
-	"bob-shell": "bob-shell",
-	// The IBM Bob IDE, which is not Bob Shell: a VS Code fork with its own settings file
-	// (`agentop configure bob`) and its own inference client. Named ibm-bob for the product,
-	// "IBM Bob", hyphenated the way claude-code is — a canonical name must be one token, or
-	// AgentName cannot fold its versions into one row.
+	// Earns its place in the FIRST-token map as well as the trailing scan because Bob
+	// Shell sends the bare form too, on /admin/v1/profile and /inference/v1/model/info,
+	// where bob-shell is the only token there is.
+	//
+	// "bob-shell" was this agent's canonical name until 2026-10-15; the spellings
+	// already recorded — ledger rows, session labels, router pins — fold back to "bob"
+	// through retiredAgents, which is what keeps the rename from splitting one agent's
+	// spend into two rows beside each other.
+	"bob-shell": "bob",
+	// The IBM Bob IDE — the other face of the same agent: a VS Code fork with its own
+	// settings file (`agentop configure bob` configures it and the shell function both)
+	// and its own inference client. Canonical name "bob", the binary's name, shared
+	// with the entry above; a canonical name must be one token, or AgentName cannot
+	// fold its versions into one row.
 	//
 	// THE PRODUCT TOKEN IS "Bob", NOT "IBM". The IDE sends "IBM Bob/2.2.1", so the first
 	// token is a bare "IBM" and the agent is the token after it — which is the trailing scan's
@@ -309,7 +319,10 @@ var knownClients = map[string]string{
 	// NOT CLAIMED: the IDE's Electron shell ("Mozilla/5.0 … IBMBob/1.126.0+bob2.2.1 …") and
 	// its update check ("Code/1.126.0+bob2.2.1 …"). Both carry the VS Code base version rather
 	// than Bob's, and "code" is no agent's token. Neither carries inference.
-	"bob": "ibm-bob",
+	//
+	// "ibm-bob" was this face's canonical name until 2026-10-15; recorded spellings fold
+	// back to "bob" through retiredAgents.
+	"bob": "bob",
 	// OpenCode's one User-Agent, sent by its TUI, its background service and its inference
 	// client alike: "opencode/<channel>/<version>/<client>", e.g. "opencode/latest/2.0.21/cli"
 	// (captured from 2.0.21). The version is the field after the channel, not the first one —
@@ -344,8 +357,12 @@ var knownClients = map[string]string{
 	// passes "codex-tui", while anything sent BEFORE that initialize completes uses the
 	// built-in default "codex_cli_rs". Both are Codex, so both fold here. Read off
 	// Codex's source at rust-v0.160.1 (tui/src/lib.rs, app-server's
-	// initialize_processor.rs, login/src/auth/default_client.rs) and both tokens
-	// confirmed present in the shipped 0.160.1 binary.
+	// initialize_processor.rs, login/src/auth/default_client.rs), then CAPTURED
+	// from a real TUI session driven through the proxy over a pty — including on
+	// the TUI's own /backend-api/codex/responses inference requests, so this is
+	// not inferred from source alone. That capture also carried 0.162.1 mid-
+	// auto-update, which is the only evidence here that the shape holds across
+	// releases rather than only on the build everything else was read from.
 	"codex-tui":    "codex",
 	"codex_cli_rs": "codex",
 	// NOT CLAIMED, though the same binary carries them as originator names:
@@ -567,6 +584,93 @@ func (c *EventClient) Label() string {
 // versionedAgent matches a label that is exactly one name/version token.
 var versionedAgent = regexp.MustCompile(`^([^\s/]+)/[^\s/]+$`)
 
+// retiredAgents maps a canonical name this package no longer produces to the name
+// that replaced it.
+//
+// A rename of a canonical agent name would otherwise split every per-agent figure in
+// two: the ledger, the session store and the router's pins all hold labels written
+// under the old spelling, and AgentName is the one seam all of them fold through on
+// read — so folding the old spellings HERE is what keeps "bob-shell/2.2.1" and
+// "bob/2.2.1" one row instead of two beside each other.
+//
+// EXACT MATCHES ONLY. An unrecognised agent's label is its raw User-Agent, which can
+// be anything; a retired name must therefore be a whole label's or a stripped
+// name's exact match, never a substring, or the fold would claim raw agents that
+// merely contain the word.
+//
+// Kept FOREVER rather than cleaned up once the last pre-rename row expires: the cost
+// is two map entries, and the ledger keeps rows far longer than any one retention
+// window. Removing an entry is the same split-the-history bug the map exists to
+// prevent, rediscovered later.
+var retiredAgents = map[string]string{
+	// Bob's two faces had two canonical names until 2026-10-15, when they converged
+	// on the binary's name. See the two knownClients entries above.
+	"bob-shell": "bob",
+	"ibm-bob":   "bob",
+}
+
+// CanonicalAgent is the canonical agent name for name, folding the spellings a
+// previous release produced to the name this one does. It is the identity function
+// on every current name, which is what lets callers apply it to values they stored
+// earlier without first having to know whether a rename ever happened.
+//
+// Takes a NAME, not a label: fold a label with AgentName first, or hand it a name a
+// config file named (the inference router's `agents:` keys and stored pins are both
+// canonicalized through this), never a raw User-Agent.
+func CanonicalAgent(name string) string {
+	if n, ok := retiredAgents[name]; ok {
+		return n
+	}
+	return name
+}
+
+// FoldAgentNames is agents keyed by canonical agent name: every key folded through
+// CanonicalAgent, so a map written before an agent-name rename — a router config's
+// `agents:`, pinned under "bob-shell" before it converged into "bob" — names the
+// agent requests report today.
+//
+// THE ONE IMPLEMENTATION OF THE MAP-LEVEL FOLD, shared by every reader and writer of
+// such a map: the inference router keys its routing table with it, and agentop reads
+// and writes the same `agents:` map through it, so the two cannot disagree about
+// which spelling a config names — a disagreement that made `server reset` report
+// "not routed" for an agent the proxy was routing.
+//
+// Sorted order with set-if-absent, so a config naming both a retired spelling and its
+// replacement resolves deterministically whichever way the map iterates: whichever
+// key sorts first wins. Deliberately the same rule on both sides rather than a
+// "current beats retired" preference, because agreeing is the property that matters
+// and this rule needs no second list of which spelling is which.
+func FoldAgentNames(agents map[string]string) map[string]string {
+	out := make(map[string]string, len(agents))
+	for _, name := range slices.Sorted(maps.Keys(agents)) {
+		canonical := CanonicalAgent(name)
+		if _, exists := out[canonical]; !exists {
+			out[canonical] = agents[name]
+		}
+	}
+	return out
+}
+
+// AgentSpellings is name and every retired spelling that folds to it, sorted: for
+// "bob", ["bob", "bob-shell", "ibm-bob"]. For every other name, just the name.
+//
+// FOR WRITERS THAT MUST CLEAR EVERY WAY A CONFIG MIGHT NAME THE AGENT: agentop's
+// server commands remove each of an agent's spellings from a router config's
+// agents: map, so a retired spelling cannot sit beside the canonical key and fold
+// back into routing once the key is gone. Read-side callers want FoldAgentNames or
+// CanonicalAgent instead.
+func AgentSpellings(name string) []string {
+	name = CanonicalAgent(name)
+	out := []string{name}
+	for retired, canonical := range retiredAgents {
+		if canonical == name && retired != name {
+			out = append(out, retired)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
 // AgentName is the agent a Label names, with its version dropped: "claude-code/2.1.285" is
 // "claude-code". It is the key every per-agent figure is filed under — the usage ring's agent
 // axis, the ledger's on read, a session's agent, and /v1/usage?agent= — so an agent's releases
@@ -577,11 +681,17 @@ var versionedAgent = regexp.MustCompile(`^([^\s/]+)/[^\s/]+$`)
 // row after half a comment, so anything with a space or a second slash is returned unchanged.
 // A single-token one does fold — "curl/8.4.0" is "curl" — which is the same rule, not an
 // exception to it.
+//
+// RETIRED SPELLINGS FOLD TOO, through CanonicalAgent: a label recorded under a name this
+// package no longer produces answers that name's replacement, so a rename does not split
+// history. "bob-shell/2.2.1" and "ibm-bob/2.2.1" are both "bob".
 func AgentName(label string) string {
 	if m := versionedAgent.FindStringSubmatch(label); m != nil {
-		return m[1]
+		return CanonicalAgent(m[1])
 	}
-	return label
+	// A label with no version — Label() omits it when an agent's User-Agent carried none —
+	// is the bare name, retired or current, so it folds through the same map.
+	return CanonicalAgent(label)
 }
 
 // AffinityName is the coding agent a request belongs to for SESSION ATTRIBUTION: Name when

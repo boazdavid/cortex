@@ -709,20 +709,32 @@ func openCodeByHand(env *setupEnv, cli string, pl openCodeDisablePlan, planned b
 }
 
 // planUnrouteBob removes IBM Bob's proxy setting when it may be Cortex's: one
-// bobOwns does not call someone else's. Bob's disable makes the edit, and its
-// refusals are this row's ✗.
+// bobOwns does not call someone else's. It also runs when only enable's shell block
+// is left, so uninstall takes out everything enable wrote. Bob's disable makes the
+// edit — the proxy, the http.systemCertificates it recorded adding, the block — and
+// its refusals are this row's ✗.
 func planUnrouteBob(env *setupEnv) (removal, bool) {
 	settings, err := bobSettingsPath(env.home)
-	if err != nil || !fileExists(settings) {
-		return removal{}, false
-	}
-	doc, err := readSettings(settings)
 	if err != nil {
 		return removal{}, false
 	}
-	val, isString := doc[bobProxyKey].(string)
 	wantProxy, caPath := bobWanted(env.configPath(), env.home)
-	if !isString || bobOwns(val, wantProxy) == bobNotOurs {
+	launch := resolveBobLaunch(env.home, env.shell)
+	proxyOurs := false
+	if fileExists(settings) {
+		doc, err := readSettings(settings)
+		if err != nil {
+			return removal{}, false
+		}
+		val, isString := doc[bobProxyKey].(string)
+		proxyOurs = isString && bobOwns(val, wantProxy) != bobNotOurs
+	}
+	blockThere := false
+	if launch.macOS && launch.rcPath != "" {
+		b, err := os.ReadFile(launch.rcPath) //nolint:gosec // the user's own shell rc file
+		blockThere = err == nil && strings.Contains(string(b), bobLaunchMarkerStart)
+	}
+	if !proxyOurs && !blockThere {
 		return removal{}, false
 	}
 	cfg := env.configPath()
@@ -732,7 +744,7 @@ func planUnrouteBob(env *setupEnv) (removal, bool) {
 		fix:   remedy{agentop: "agentop configure bob disable", byHand: "remove \"" + bobProxyKey + "\" from " + env.tilde(settings)},
 		run: func(*checklist.Running) (string, []string, error) {
 			var out, errb bytes.Buffer
-			if bobDisable(settings, cfg, wantProxy, caPath, true, &out, &errb) != 0 {
+			if bobDisableEditor(settings, cfg, wantProxy, caPath, launch, &out, &errb) != 0 {
 				return "", []string{env.tilde(settings)}, errors.New(lastLineOf(errb.String(), out.String()))
 			}
 			return "IBM Bob no longer goes through Cortex · restart Bob", nil, nil
@@ -742,9 +754,9 @@ func planUnrouteBob(env *setupEnv) (removal, bool) {
 
 // planRemoveBobShell removes the bob shell function when the rc file holds the
 // block enable writes exactly once. A block that is not that, edited or there
-// twice, is the user's: bobshell disable leaves it, so this only says so, with a
+// twice, is the user's: `configure bob disable` leaves it, so this only says so, with a
 // ! row and the lines to delete by hand. The file is followed through one link,
-// as bobshell's verbs follow it, so the edit lands in a dotfiles repo's copy
+// as configure bob's shell half follows it, so the edit lands in a dotfiles repo's copy
 // rather than replacing the link.
 func planRemoveBobShell(env *setupEnv) (removal, bool) {
 	rc, err := bobShellRCPath(env.shell, env.home)
@@ -773,7 +785,7 @@ func planRemoveBobShell(env *setupEnv) (removal, bool) {
 	return removal{
 		label: "removed",
 		item:  checklist.Item{Verb: "remove", What: "the bob shell function", Where: env.tilde(rc)},
-		fix: remedy{agentop: "agentop configure bobshell disable",
+		fix: remedy{agentop: "agentop configure bob disable",
 			byHand: "delete the lines from \"" + bobShellMarkerStart + "\" to \"" + bobShellMarkerEnd + "\" in " + env.tilde(rc)},
 		run: func(*checklist.Running) (string, []string, error) {
 			var out, errb bytes.Buffer

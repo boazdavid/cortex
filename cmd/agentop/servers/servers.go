@@ -57,14 +57,39 @@ func Inactive(policy pipeline.ErrorPolicy, file string) string {
 	return ""
 }
 
-// AgentChange routes agent's new sessions to server, or stops routing it when server is "": the
-// one change `agentop server use`, `agentop server reset` and the TUI's S picker make.
-func AgentChange(agent, server string) edit.ConfigChange {
-	ch := edit.ConfigChange{Chain: "outbound", Plugin: PluginName, Path: []string{"agents", agent}}
-	if server != "" {
-		ch.Value = edit.ScalarValue(server)
+// AgentChanges routes agent's new sessions to server, or stops routing it when
+// server is "": the changes `agentop server use`, `agentop server reset` and the
+// TUI's S picker make. ONE AGENT'S SPELLINGS AND NOTHING ELSE: a removal for every
+// spelling the agent ever had — so a retired one ("bob-shell" beside "bob") cannot
+// sit beside the canonical key and fold back into routing once it is gone — plus,
+// when routing, the one set of the canonical key.
+//
+// PER-KEY, NOT A WHOLE-MAP REPLACEMENT, deliberately: the write must not depend on
+// a snapshot of the agents: map, or a concurrent write for a different agent — a
+// shell `server use` while the TUI's picker is open, its view up to a poll stale —
+// is silently reverted. Per-key changes touch only this agent's spellings, so
+// sibling keys, their order and their comments survive byte for byte, and a removal
+// of a spelling the file does not name is a no-op.
+//
+// agent is the agent to change, itself canonical — callers fold the name they were
+// given.
+func AgentChanges(agent, server string) []edit.ConfigChange {
+	var changes []edit.ConfigChange
+	for _, spelling := range pipeline.AgentSpellings(agent) {
+		if server != "" && spelling == agent {
+			continue // the set below replaces this key in place
+		}
+		changes = append(changes, edit.ConfigChange{
+			Chain: "outbound", Plugin: PluginName, Path: []string{"agents", spelling},
+		})
 	}
-	return ch
+	if server != "" {
+		changes = append(changes, edit.ConfigChange{
+			Chain: "outbound", Plugin: PluginName, Path: []string{"agents", agent},
+			Value: edit.ScalarValue(server),
+		})
+	}
+	return changes
 }
 
 // Host is how a server's URL is shown: its host, or the whole URL for plain http, so a server
@@ -91,8 +116,8 @@ func Mapping(s routerconfig.Server) string {
 	return "main " + s.Main + " · helper " + s.Helper
 }
 
-// ForHost is the server whose host hostport names, compared as the plugin matches a request:
-// port-stripped and lowercased. ok is false for a host no server has, and for "".
+// ForHost is the server whose host hostport names, compared as the plugin matches a request.
+// ok is false for a host no server has, and for "".
 //
 // Unambiguous because the router refuses two servers on one host — the rule exists so that a
 // session's server can be named from where its requests went.
@@ -100,9 +125,9 @@ func ForHost(c routerconfig.Config, hostport string) (name string, ok bool) {
 	if hostport == "" {
 		return "", false
 	}
-	h := routerconfig.Hostname(hostport)
+	h := routerconfig.Key(hostport)
 	for _, name := range slices.Sorted(maps.Keys(c.Servers)) {
-		if ep, err := routerconfig.ParseURL(c.Servers[name].URL); err == nil && ep.Hostname == h {
+		if ep, err := routerconfig.ParseURL(c.Servers[name].URL); err == nil && ep.Key() == h {
 			return name, true
 		}
 	}
